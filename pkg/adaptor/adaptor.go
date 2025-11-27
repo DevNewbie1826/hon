@@ -171,6 +171,21 @@ func (w *ResponseWriter) ReadFrom(r io.Reader) (n int64, err error) {
 		}
 	}
 
+	// Future-proof: If netpoll supports io.ReaderFrom (sendfile), use it.
+	// This requires that we are NOT using chunked encoding, as sendfile sends raw data.
+	// 미래 대비: netpoll이 io.ReaderFrom(sendfile)을 지원하는 경우 이를 사용합니다.
+	// sendfile은 원시 데이터를 전송하므로 Chunked 인코딩을 사용하지 않아야 합니다.
+	if !w.chunked {
+		// Flush any buffered data first to maintain order
+		// 순서를 유지하기 위해 버퍼링된 데이터를 먼저 플러시합니다.
+		w.bufWriter.Flush()
+
+		// Check if the underlying connection implements io.ReaderFrom
+		if rf, ok := w.ctx.Conn().(io.ReaderFrom); ok {
+			return rf.ReadFrom(r)
+		}
+	}
+
 	bufPtr := copyBufPool.Get().(*[]byte)
 	buf := *bufPtr
 	defer copyBufPool.Put(bufPtr)
