@@ -5,6 +5,7 @@ import (
 	"io"
 	"log"
 	"net/http"
+	"runtime/debug"
 	"time"
 
 	"github.com/DevNewbie1826/hon/pkg/adaptor"
@@ -103,7 +104,7 @@ func (e *Engine) handleRequest(ctx *appcontext.RequestContext) (*http.Request, b
 	func() {
 		defer func() {
 			if r := recover(); r != nil {
-				log.Printf("[Panic] Recovered in handler: %v", r)
+				log.Printf("[Panic] Recovered in handler: %v\n%s", r, debug.Stack())
 				respWriter.WriteHeader(http.StatusInternalServerError)
 			}
 		}()

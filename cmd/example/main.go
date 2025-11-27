@@ -126,7 +126,7 @@ func sseHandler(w http.ResponseWriter, r *http.Request) {
 func fileHandler(w http.ResponseWriter, r *http.Request) {
 	// 예시로 현재 실행 중인 main.go 파일을 서빙합니다.
 	// 실제로는 대용량 비디오나 이미지를 서빙할 때 유용합니다.
-	http.ServeFile(w, r, "main.go")
+	http.ServeFile(w, r, "README.md")
 }
 
 var upgrader = gws.NewUpgrader(&Handler{}, &gws.ServerOption{
