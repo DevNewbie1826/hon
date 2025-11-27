@@ -10,20 +10,19 @@ import (
 	"sync"
 
 	"github.com/DevNewbie1826/hon/pkg/appcontext"
-	"github.com/DevNewbie1826/hon/pkg/bytebufferpool"
 )
 
 // ResponseWriter implements http.ResponseWriter and wraps netpoll connection.
 // ResponseWriter는 http.ResponseWriter 인터페이스를 구현하며 netpoll 연결을 래핑합니다.
 type ResponseWriter struct {
-	ctx        *appcontext.RequestContext
-	req        *http.Request
-	header     http.Header
-	statusCode int
-	body       *bytebufferpool.ByteBuffer
-	hijacked   bool
-	headerSent bool
-	chunked    bool
+	ctx          *appcontext.RequestContext
+	req          *http.Request
+	header       http.Header
+	statusCode   int
+	hijacked     bool
+	headerSent   bool
+	chunked      bool
+	bufWriter    *bufio.Writer // Buffering for efficient writes
 }
 
 // rwPool recycles ResponseWriter objects to reduce GC pressure.
@@ -45,6 +44,17 @@ var copyBufPool = sync.Pool{
 	},
 }
 
+// bufWriterPool recycles bufio.Writer objects.
+// bufWriterPool은 bufio.Writer 객체를 재활용합니다.
+var bufWriterPool = sync.Pool{
+	New: func() any {
+		// Default bufio.Writer buffer size is 4KB.
+		// 기본 bufio.Writer 버퍼 크기는 4KB입니다.
+		return bufio.NewWriter(nil) 
+	},
+}
+
+
 // NewResponseWriter retrieves a ResponseWriter from the pool and initializes it.
 // NewResponseWriter는 풀에서 ResponseWriter를 가져와 초기화합니다.
 func NewResponseWriter(ctx *appcontext.RequestContext, req *http.Request) *ResponseWriter {
@@ -55,13 +65,26 @@ func NewResponseWriter(ctx *appcontext.RequestContext, req *http.Request) *Respo
 	w.hijacked = false
 	w.headerSent = false
 	w.chunked = false
-	w.body = bytebufferpool.Get()
+	
+	// Get bufio.Writer from pool and reset it with the current connection
+	// 풀에서 bufio.Writer를 가져와 현재 연결로 리셋합니다.
+	bw := bufWriterPool.Get().(*bufio.Writer)
+	bw.Reset(w.ctx.Conn())
+	w.bufWriter = bw
+
 	return w
 }
 
 // Release returns the ResponseWriter and its resources to their respective pools.
 // Release는 ResponseWriter와 리소스를 각각의 풀로 반환합니다.
 func (w *ResponseWriter) Release() {
+	// Put bufWriter back to pool FIRST
+	// bufWriter를 먼저 풀에 반환합니다.
+	if w.bufWriter != nil {
+		bufWriterPool.Put(w.bufWriter)
+		w.bufWriter = nil // Avoid lingering pointer
+	}
+
 	w.ctx = nil
 	w.req = nil
 	w.statusCode = 0
@@ -73,13 +96,6 @@ func (w *ResponseWriter) Release() {
 	// 헤더 초기화
 	for k := range w.header {
 		delete(w.header, k)
-	}
-
-	// Return body buffer to its pool
-	// 바디 버퍼를 풀로 반환
-	if w.body != nil {
-		bytebufferpool.Put(w.body)
-		w.body = nil
 	}
 
 	rwPool.Put(w)
@@ -120,31 +136,41 @@ func (w *ResponseWriter) Write(p []byte) (int, error) {
 	if w.hijacked {
 		return 0, http.ErrHijacked
 	}
-	return w.body.Write(p)
+
+	if !w.headerSent {
+		if err := w.ensureHeaderSent(); err != nil {
+			return 0, err
+		}
+	}
+
+	if w.chunked {
+		// Chunk header
+		fmt.Fprintf(w.bufWriter, "%x\r\n", len(p))
+		// Chunk data
+		n, err := w.bufWriter.Write(p)
+		// Chunk trailer
+		w.bufWriter.Write([]byte("\r\n"))
+		return n, err
+	}
+
+	return w.bufWriter.Write(p)
 }
 
 // ReadFrom implements io.ReaderFrom.
 // ReadFrom은 io.ReaderFrom 인터페이스를 구현합니다.
-// It uses copyBufPool to read data and writes directly to the connection to minimize memory usage and copying.
-// copyBufPool을 사용하여 데이터를 읽고 연결에 직접 씀으로써 메모리 사용량과 복사를 최소화합니다.
+// It uses copyBufPool to read data and writes directly to bufWriter.
+// copyBufPool을 사용하여 데이터를 읽고 bufWriter에 직접 씀으로써 메모리 사용량과 복사를 최소화합니다.
 func (w *ResponseWriter) ReadFrom(r io.Reader) (n int64, err error) {
 	if w.hijacked {
 		return 0, http.ErrHijacked
 	}
 
-	// Flush any pending data in w.body first?
-	// w.body에 대기 중인 데이터가 있다면 먼저 플러시해야 합니다.
-	if w.body.Len() > 0 {
-		w.Flush()
+	if !w.headerSent {
+		if err := w.ensureHeaderSent(); err != nil {
+			return 0, err
+		}
 	}
 
-	// Ensure headers are sent.
-	// 헤더가 전송되었는지 확인합니다.
-	if err := w.ensureHeaderSent(); err != nil {
-		return 0, err
-	}
-
-	conn := w.ctx.Conn()
 	bufPtr := copyBufPool.Get().(*[]byte)
 	buf := *bufPtr
 	defer copyBufPool.Put(bufPtr)
@@ -152,24 +178,24 @@ func (w *ResponseWriter) ReadFrom(r io.Reader) (n int64, err error) {
 	for {
 		nr, er := r.Read(buf)
 		if nr > 0 {
-			// Write directly to connection
-			// 연결에 직접 씁니다.
+			// Write directly to bufWriter
+			// bufWriter에 직접 씁니다.
 			if w.chunked {
 				// Chunk header
-				fmt.Fprintf(conn, "%x\r\n", nr)
+				fmt.Fprintf(w.bufWriter, "%x\r\n", nr)
 				// Chunk data
-				if _, ew := conn.Write(buf[:nr]); ew != nil {
+				if _, ew := w.bufWriter.Write(buf[:nr]); ew != nil {
 					err = ew
 					break
 				}
 				// Chunk trailer
-				if _, ew := conn.Write([]byte("\r\n")); ew != nil {
+				if _, ew := w.bufWriter.Write([]byte("\r\n")); ew != nil {
 					err = ew
 					break
 				}
 			} else {
 				// Normal direct write
-				if _, ew := conn.Write(buf[:nr]); ew != nil {
+				if _, ew := w.bufWriter.Write(buf[:nr]); ew != nil {
 					err = ew
 					break
 				}
@@ -202,14 +228,19 @@ func (w *ResponseWriter) ensureHeaderSent() error {
 		return nil
 	}
 
-	conn := w.ctx.Conn()
-
-	// Check if we need to use chunked encoding
-	// Content-Length가 없으면 Chunked 인코딩을 사용합니다.
+	// If Content-Length is not set, we must use chunked encoding because we are streaming.
+	// Content-Length가 설정되지 않았다면 스트리밍 중이므로 Chunked 인코딩을 사용해야 합니다.
 	if w.header.Get("Content-Length") == "" {
 		w.chunked = true
 		w.header.Set("Transfer-Encoding", "chunked")
+	} else {
+		w.chunked = false
 	}
+	
+	// Set Default Content-Type if not present
+	// Content-Type이 없으면 기본값(text/plain 또는 application/octet-stream)을 추론하기 어렵습니다.
+	// 표준 라이브러리는 Sniffing을 하지만 여기서는 생략하거나 기본값만 처리합니다.
+	// 여기서는 생략합니다. 사용자가 설정해야 합니다.
 
 	statusText := http.StatusText(w.statusCode)
 	if statusText == "" {
@@ -217,13 +248,13 @@ func (w *ResponseWriter) ensureHeaderSent() error {
 	}
 	headerLine := fmt.Sprintf("HTTP/1.1 %d %s\r\n", w.statusCode, statusText)
 
-	if _, err := conn.Write([]byte(headerLine)); err != nil {
+	if _, err := w.bufWriter.Write([]byte(headerLine)); err != nil {
 		return err
 	}
-	if err := w.header.Write(conn); err != nil {
+	if err := w.header.Write(w.bufWriter); err != nil {
 		return err
 	}
-	if _, err := conn.Write([]byte("\r\n")); err != nil {
+	if _, err := w.bufWriter.Write([]byte("\r\n")); err != nil {
 		return err
 	}
 	w.headerSent = true
@@ -232,34 +263,14 @@ func (w *ResponseWriter) ensureHeaderSent() error {
 
 // Flush sends any buffered data to the client.
 // Flush는 버퍼링된 모든 데이터를 클라이언트로 전송합니다.
+// This will flush the underlying bufio.Writer.
+// 이는 기반의 bufio.Writer를 플러시합니다.
 func (w *ResponseWriter) Flush() {
 	if w.hijacked {
 		return
 	}
-
-	// 1. Send Headers if not sent yet
-	// 1. 아직 헤더를 보내지 않았다면 전송합니다.
-	if err := w.ensureHeaderSent(); err != nil {
-		return
-	}
-
-	// 2. Send buffered body
-	// 2. 버퍼링된 바디를 전송합니다.
-	if w.body.Len() > 0 {
-		conn := w.ctx.Conn()
-		if w.chunked {
-			// Write chunk header: "Size\r\n"
-			fmt.Fprintf(conn, "%x\r\n", w.body.Len())
-			// Write chunk data
-			conn.Write(w.body.Bytes())
-			// Write chunk trailer: "\r\n"
-			conn.Write([]byte("\r\n"))
-		} else {
-			// Normal write
-			conn.Write(w.body.Bytes())
-		}
-		w.body.Reset() // Clear buffer after flushing // 플러시 후 버퍼 초기화
-	}
+	w.ensureHeaderSent()
+	w.bufWriter.Flush()
 }
 
 // Hijack lets the caller take over the connection.
@@ -270,11 +281,17 @@ func (w *ResponseWriter) Hijack() (net.Conn, *bufio.ReadWriter, error) {
 	}
 	w.hijacked = true
 
+	// Ensure any buffered data is flushed before hijacking.
+	// 하이재킹 전에 버퍼링된 데이터가 모두 플러시되었는지 확인합니다.
+	w.bufWriter.Flush()
+
 	conn := w.ctx.Conn()
 	reader := w.ctx.GetReader()
-	writer := bufio.NewWriter(conn)
+	// Create a new bufio.ReadWriter for the hijacked connection.
+	// 하이재킹된 연결을 위해 새로운 bufio.ReadWriter를 생성합니다.
+	hijackedBufWriter := bufio.NewWriter(conn) // Use a new writer for Hijack, don't reuse the pooled one
 
-	return conn, bufio.NewReadWriter(reader, writer), nil
+	return conn, bufio.NewReadWriter(reader, hijackedBufWriter), nil
 }
 
 // Hijacked returns whether the connection has been hijacked.
@@ -290,77 +307,26 @@ func (w *ResponseWriter) EndResponse() error {
 		return nil
 	}
 
-	conn := w.ctx.Conn()
-	bodyLen := w.body.Len()
-
-	// If headers already sent (via Flush or ReadFrom)
-	// 헤더가 이미 전송된 경우(Flush 또는 ReadFrom을 통해)
-	if w.headerSent {
-		if bodyLen > 0 {
-			if w.chunked {
-				fmt.Fprintf(conn, "%x\r\n", bodyLen)
-				conn.Write(w.body.Bytes())
-				conn.Write([]byte("\r\n"))
-			} else {
-				conn.Write(w.body.Bytes())
-			}
-		}
-		// If chunked, send terminating chunk
-		// Chunked 인코딩인 경우 종료 청크 전송
-		if w.chunked {
-			conn.Write([]byte("0\r\n\r\n"))
-		}
-		return nil
-	}
-
-	// Normal response (not flushed yet)
-	// 일반 응답 (아직 플러시되지 않음)
-
-	// Set Content-Length if not present
-	// Content-Length가 없으면 설정합니다.
-	if w.header.Get("Content-Length") == "" {
-		w.header.Set("Content-Length", fmt.Sprintf("%d", bodyLen))
-	}
-
-	// Set Default Content-Type if not present and body is not empty
-	// 본문이 비어있지 않고 Content-Type이 없으면 기본값을 설정합니다.
-	if bodyLen > 0 && w.header.Get("Content-Type") == "" {
-		w.header.Set("Content-Type", http.DetectContentType(w.body.B))
-	}
-
-	// Prepare Status Line
-	// 상태 라인 준비
-	statusText := http.StatusText(w.statusCode)
-	if statusText == "" {
-		statusText = "status code " + fmt.Sprintf("%d", w.statusCode)
-	}
-	headerLine := fmt.Sprintf("HTTP/1.1 %d %s\r\n", w.statusCode, statusText)
-
-	// 1. Write Status Line
-	// 1. 상태 라인 전송
-	if _, err := conn.Write([]byte(headerLine)); err != nil {
-		return err
-	}
-
-	// 2. Write Headers
-	// 2. 헤더 전송
-	if err := w.header.Write(conn); err != nil {
-		return err
-	}
-
-	// 3. Write Header End
-	// 3. 헤더 종료 문자 전송
-	if _, err := conn.Write([]byte("\r\n")); err != nil {
-		return err
-	}
-
-	// 4. Write Body
-	// 4. 바디 전송
-	if bodyLen > 0 {
-		if _, err := conn.Write(w.body.Bytes()); err != nil {
+	// If headers not sent yet, it means no body was written.
+	// 헤더가 아직 전송되지 않았다면 바디가 없었다는 의미입니다.
+	if !w.headerSent {
+		w.header.Set("Content-Length", "0")
+		// Fallback to ensuring headers are sent, which will also set Chunked if needed.
+		// 이 경우 Content-Length: 0이므로 Chunked가 아님.
+		if err := w.ensureHeaderSent(); err != nil {
 			return err
 		}
 	}
 
-	return nil
+	// If chunked, send terminating chunk
+	// Chunked 인코딩인 경우 종료 청크 전송
+	if w.chunked {
+		if _, err := w.bufWriter.Write([]byte("0\r\n\r\n")); err != nil {
+			return err
+		}
+	}
+
+	// Flush any remaining buffered data
+	// 버퍼링된 남은 데이터 플러시
+	return w.bufWriter.Flush()
 }
