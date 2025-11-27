@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log"
 	"net"
 	"net/http"
 	"sync"
@@ -171,15 +172,17 @@ func (w *ResponseWriter) Flush() {
 
 // ReadFrom implements io.ReaderFrom.
 func (w *ResponseWriter) ReadFrom(r io.Reader) (n int64, err error) {
+	log.Println("Debug: ReadFrom called")
 	if w.hijacked {
 		return 0, http.ErrHijacked
 	}
 	// ByteBuffer implements ReadFrom, efficiently reading into the buffer.
-	return w.body.ReadFrom(r)
+	n, err = w.body.ReadFrom(r)
+	log.Printf("Debug: ReadFrom finished. n=%d, err=%v, bodyLen=%d", n, err, w.body.Len())
+	return n, err
 }
 
 // Hijack lets the caller take over the connection.
-// Hijack은 호출자가 연결 제어권을 가져가도록 합니다.
 func (w *ResponseWriter) Hijack() (net.Conn, *bufio.ReadWriter, error) {
 	if w.hijacked {
 		return nil, nil, errors.New("already hijacked")
@@ -194,13 +197,11 @@ func (w *ResponseWriter) Hijack() (net.Conn, *bufio.ReadWriter, error) {
 }
 
 // Hijacked returns whether the connection has been hijacked.
-// Hijacked는 연결이 하이재킹되었는지 여부를 반환합니다.
 func (w *ResponseWriter) Hijacked() bool {
 	return w.hijacked
 }
 
 // EndResponse serializes and writes the HTTP response to the connection.
-// EndResponse는 HTTP 응답을 직렬화하여 연결에 씁니다.
 func (w *ResponseWriter) EndResponse() error {
 	if w.hijacked {
 		return nil
@@ -208,6 +209,8 @@ func (w *ResponseWriter) EndResponse() error {
 
 	conn := w.ctx.Conn()
 	bodyLen := w.body.Len()
+
+	log.Printf("Debug: EndResponse. Header Content-Length=%s, bodyLen=%d, headerSent=%v", w.header.Get("Content-Length"), bodyLen, w.headerSent)
 
 	// If headers already sent (via Flush), just write remaining body
 	// 헤더가 이미 전송된 경우(Flush를 통해), 남은 바디만 씁니다.
