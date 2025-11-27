@@ -24,6 +24,7 @@ type ResponseWriter struct {
 	body       *bytebufferpool.ByteBuffer
 	hijacked   bool
 	headerSent bool
+	chunked    bool
 }
 
 // rwPool recycles ResponseWriter objects to reduce GC pressure.
@@ -54,6 +55,7 @@ func NewResponseWriter(ctx *appcontext.RequestContext, req *http.Request) *Respo
 	w.statusCode = http.StatusOK
 	w.hijacked = false
 	w.headerSent = false
+	w.chunked = false
 	w.body = bytebufferpool.Get()
 	return w
 }
@@ -66,6 +68,7 @@ func (w *ResponseWriter) Release() {
 	w.statusCode = 0
 	w.hijacked = false
 	w.headerSent = false
+	w.chunked = false
 
 	// Clear headers
 	// 헤더 초기화
@@ -121,6 +124,19 @@ func (w *ResponseWriter) Write(p []byte) (int, error) {
 	return w.body.Write(p)
 }
 
+// ReadFrom implements io.ReaderFrom.
+// ReadFrom은 io.ReaderFrom 인터페이스를 구현합니다.
+func (w *ResponseWriter) ReadFrom(r io.Reader) (n int64, err error) {
+	log.Println("Debug: ReadFrom called")
+	if w.hijacked {
+		return 0, http.ErrHijacked
+	}
+	// ByteBuffer implements ReadFrom, efficiently reading into the buffer.
+	n, err = w.body.ReadFrom(r)
+	log.Printf("Debug: ReadFrom finished. n=%d, err=%v, bodyLen=%d", n, err, w.body.Len())
+	return n, err
+}
+
 // WriteHeader sends an HTTP response header with the provided status code.
 // WriteHeader는 제공된 상태 코드로 HTTP 응답 헤더를 전송합니다.
 func (w *ResponseWriter) WriteHeader(statusCode int) {
@@ -142,6 +158,13 @@ func (w *ResponseWriter) Flush() {
 	// 1. Send Headers if not sent yet
 	// 1. 아직 헤더를 보내지 않았다면 전송합니다.
 	if !w.headerSent {
+		// Check if we need to use chunked encoding
+		// Content-Length가 없으면 Chunked 인코딩을 사용합니다.
+		if w.header.Get("Content-Length") == "" {
+			w.chunked = true
+			w.header.Set("Transfer-Encoding", "chunked")
+		}
+
 		statusText := http.StatusText(w.statusCode)
 		if statusText == "" {
 			statusText = "status code " + fmt.Sprintf("%d", w.statusCode)
@@ -163,26 +186,23 @@ func (w *ResponseWriter) Flush() {
 	// 2. Send buffered body
 	// 2. 버퍼링된 바디를 전송합니다.
 	if w.body.Len() > 0 {
-		if _, err := conn.Write(w.body.Bytes()); err != nil {
-			return
+		if w.chunked {
+			// Write chunk header: "Size\r\n"
+			fmt.Fprintf(conn, "%x\r\n", w.body.Len())
+			// Write chunk data
+			conn.Write(w.body.Bytes())
+			// Write chunk trailer: "\r\n"
+			conn.Write([]byte("\r\n"))
+		} else {
+			// Normal write (Content-Length should have been set if not chunked, but here it might be partial if flushed early without chunked - which is risky but allowed if conn closes)
+			conn.Write(w.body.Bytes())
 		}
 		w.body.Reset() // Clear buffer after flushing // 플러시 후 버퍼 초기화
 	}
 }
 
-// ReadFrom implements io.ReaderFrom.
-func (w *ResponseWriter) ReadFrom(r io.Reader) (n int64, err error) {
-	log.Println("Debug: ReadFrom called")
-	if w.hijacked {
-		return 0, http.ErrHijacked
-	}
-	// ByteBuffer implements ReadFrom, efficiently reading into the buffer.
-	n, err = w.body.ReadFrom(r)
-	log.Printf("Debug: ReadFrom finished. n=%d, err=%v, bodyLen=%d", n, err, w.body.Len())
-	return n, err
-}
-
 // Hijack lets the caller take over the connection.
+// Hijack은 호출자가 연결 제어권을 가져가도록 합니다.
 func (w *ResponseWriter) Hijack() (net.Conn, *bufio.ReadWriter, error) {
 	if w.hijacked {
 		return nil, nil, errors.New("already hijacked")
@@ -197,11 +217,13 @@ func (w *ResponseWriter) Hijack() (net.Conn, *bufio.ReadWriter, error) {
 }
 
 // Hijacked returns whether the connection has been hijacked.
+// Hijacked는 연결이 하이재킹되었는지 여부를 반환합니다.
 func (w *ResponseWriter) Hijacked() bool {
 	return w.hijacked
 }
 
 // EndResponse serializes and writes the HTTP response to the connection.
+// EndResponse는 HTTP 응답을 직렬화하여 연결에 씁니다.
 func (w *ResponseWriter) EndResponse() error {
 	if w.hijacked {
 		return nil
@@ -210,17 +232,30 @@ func (w *ResponseWriter) EndResponse() error {
 	conn := w.ctx.Conn()
 	bodyLen := w.body.Len()
 
-	log.Printf("Debug: EndResponse. Header Content-Length=%s, bodyLen=%d, headerSent=%v", w.header.Get("Content-Length"), bodyLen, w.headerSent)
+	log.Printf("Debug: EndResponse. Header Content-Length=%s, bodyLen=%d, headerSent=%v, chunked=%v", w.header.Get("Content-Length"), bodyLen, w.headerSent, w.chunked)
 
-	// If headers already sent (via Flush), just write remaining body
-	// 헤더가 이미 전송된 경우(Flush를 통해), 남은 바디만 씁니다.
+	// If headers already sent (via Flush)
+	// 헤더가 이미 전송된 경우
 	if w.headerSent {
 		if bodyLen > 0 {
-			_, err := conn.Write(w.body.Bytes())
-			return err
+			if w.chunked {
+				fmt.Fprintf(conn, "%x\r\n", bodyLen)
+				conn.Write(w.body.Bytes())
+				conn.Write([]byte("\r\n"))
+			} else {
+				conn.Write(w.body.Bytes())
+			}
+		}
+		// If chunked, send terminating chunk
+		// Chunked 인코딩인 경우 종료 청크 전송
+		if w.chunked {
+			conn.Write([]byte("0\r\n\r\n"))
 		}
 		return nil
 	}
+
+	// Normal response (not flushed yet)
+	// 일반 응답 (아직 플러시되지 않음)
 
 	// Set Content-Length if not present
 	// Content-Length가 없으면 설정합니다.
