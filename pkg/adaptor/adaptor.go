@@ -5,7 +5,6 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"log"
 	"net"
 	"net/http"
 	"sync"
@@ -126,14 +125,64 @@ func (w *ResponseWriter) Write(p []byte) (int, error) {
 
 // ReadFrom implements io.ReaderFrom.
 // ReadFrom은 io.ReaderFrom 인터페이스를 구현합니다.
+// It uses copyBufPool to read data and writes directly to the connection to minimize memory usage and copying.
+// copyBufPool을 사용하여 데이터를 읽고 연결에 직접 씀으로써 메모리 사용량과 복사를 최소화합니다.
 func (w *ResponseWriter) ReadFrom(r io.Reader) (n int64, err error) {
-	log.Println("Debug: ReadFrom called")
 	if w.hijacked {
 		return 0, http.ErrHijacked
 	}
-	// ByteBuffer implements ReadFrom, efficiently reading into the buffer.
-	n, err = w.body.ReadFrom(r)
-	log.Printf("Debug: ReadFrom finished. n=%d, err=%v, bodyLen=%d", n, err, w.body.Len())
+
+	// Flush any pending data in w.body first?
+	// w.body에 대기 중인 데이터가 있다면 먼저 플러시해야 합니다.
+	if w.body.Len() > 0 {
+		w.Flush()
+	}
+
+	// Ensure headers are sent.
+	// 헤더가 전송되었는지 확인합니다.
+	if err := w.ensureHeaderSent(); err != nil {
+		return 0, err
+	}
+
+	conn := w.ctx.Conn()
+	bufPtr := copyBufPool.Get().(*[]byte)
+	buf := *bufPtr
+	defer copyBufPool.Put(bufPtr)
+
+	for {
+		nr, er := r.Read(buf)
+		if nr > 0 {
+			// Write directly to connection
+			// 연결에 직접 씁니다.
+			if w.chunked {
+				// Chunk header
+				fmt.Fprintf(conn, "%x\r\n", nr)
+				// Chunk data
+				if _, ew := conn.Write(buf[:nr]); ew != nil {
+					err = ew
+					break
+				}
+				// Chunk trailer
+				if _, ew := conn.Write([]byte("\r\n")); ew != nil {
+					err = ew
+					break
+				}
+			} else {
+				// Normal direct write
+				if _, ew := conn.Write(buf[:nr]); ew != nil {
+					err = ew
+					break
+				}
+			}
+			n += int64(nr)
+		}
+		if er != nil {
+			if er != io.EOF {
+				err = er
+			}
+			break
+		}
+	}
 	return n, err
 }
 
@@ -146,6 +195,41 @@ func (w *ResponseWriter) WriteHeader(statusCode int) {
 	w.statusCode = statusCode
 }
 
+// ensureHeaderSent sends headers if they haven't been sent yet.
+// ensureHeaderSent는 헤더가 아직 전송되지 않았다면 전송합니다.
+func (w *ResponseWriter) ensureHeaderSent() error {
+	if w.headerSent {
+		return nil
+	}
+
+	conn := w.ctx.Conn()
+
+	// Check if we need to use chunked encoding
+	// Content-Length가 없으면 Chunked 인코딩을 사용합니다.
+	if w.header.Get("Content-Length") == "" {
+		w.chunked = true
+		w.header.Set("Transfer-Encoding", "chunked")
+	}
+
+	statusText := http.StatusText(w.statusCode)
+	if statusText == "" {
+		statusText = "status code " + fmt.Sprintf("%d", w.statusCode)
+	}
+	headerLine := fmt.Sprintf("HTTP/1.1 %d %s\r\n", w.statusCode, statusText)
+
+	if _, err := conn.Write([]byte(headerLine)); err != nil {
+		return err
+	}
+	if err := w.header.Write(conn); err != nil {
+		return err
+	}
+	if _, err := conn.Write([]byte("\r\n")); err != nil {
+		return err
+	}
+	w.headerSent = true
+	return nil
+}
+
 // Flush sends any buffered data to the client.
 // Flush는 버퍼링된 모든 데이터를 클라이언트로 전송합니다.
 func (w *ResponseWriter) Flush() {
@@ -153,39 +237,16 @@ func (w *ResponseWriter) Flush() {
 		return
 	}
 
-	conn := w.ctx.Conn()
-
 	// 1. Send Headers if not sent yet
 	// 1. 아직 헤더를 보내지 않았다면 전송합니다.
-	if !w.headerSent {
-		// Check if we need to use chunked encoding
-		// Content-Length가 없으면 Chunked 인코딩을 사용합니다.
-		if w.header.Get("Content-Length") == "" {
-			w.chunked = true
-			w.header.Set("Transfer-Encoding", "chunked")
-		}
-
-		statusText := http.StatusText(w.statusCode)
-		if statusText == "" {
-			statusText = "status code " + fmt.Sprintf("%d", w.statusCode)
-		}
-		headerLine := fmt.Sprintf("HTTP/1.1 %d %s\r\n", w.statusCode, statusText)
-
-		if _, err := conn.Write([]byte(headerLine)); err != nil {
-			return
-		}
-		if err := w.header.Write(conn); err != nil {
-			return
-		}
-		if _, err := conn.Write([]byte("\r\n")); err != nil {
-			return
-		}
-		w.headerSent = true
+	if err := w.ensureHeaderSent(); err != nil {
+		return
 	}
 
 	// 2. Send buffered body
 	// 2. 버퍼링된 바디를 전송합니다.
 	if w.body.Len() > 0 {
+		conn := w.ctx.Conn()
 		if w.chunked {
 			// Write chunk header: "Size\r\n"
 			fmt.Fprintf(conn, "%x\r\n", w.body.Len())
@@ -194,7 +255,7 @@ func (w *ResponseWriter) Flush() {
 			// Write chunk trailer: "\r\n"
 			conn.Write([]byte("\r\n"))
 		} else {
-			// Normal write (Content-Length should have been set if not chunked, but here it might be partial if flushed early without chunked - which is risky but allowed if conn closes)
+			// Normal write
 			conn.Write(w.body.Bytes())
 		}
 		w.body.Reset() // Clear buffer after flushing // 플러시 후 버퍼 초기화
@@ -232,10 +293,8 @@ func (w *ResponseWriter) EndResponse() error {
 	conn := w.ctx.Conn()
 	bodyLen := w.body.Len()
 
-	log.Printf("Debug: EndResponse. Header Content-Length=%s, bodyLen=%d, headerSent=%v, chunked=%v", w.header.Get("Content-Length"), bodyLen, w.headerSent, w.chunked)
-
-	// If headers already sent (via Flush)
-	// 헤더가 이미 전송된 경우
+	// If headers already sent (via Flush or ReadFrom)
+	// 헤더가 이미 전송된 경우(Flush 또는 ReadFrom을 통해)
 	if w.headerSent {
 		if bodyLen > 0 {
 			if w.chunked {
