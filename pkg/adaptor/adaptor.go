@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"errors"
 	"fmt"
+	"io"
 	"net"
 	"net/http"
 	"sync"
@@ -166,6 +167,15 @@ func (w *ResponseWriter) Flush() {
 		}
 		w.body.Reset() // Clear buffer after flushing // 플러시 후 버퍼 초기화
 	}
+}
+
+// ReadFrom implements io.ReaderFrom.
+func (w *ResponseWriter) ReadFrom(r io.Reader) (n int64, err error) {
+	if w.hijacked {
+		return 0, http.ErrHijacked
+	}
+	// ByteBuffer implements ReadFrom, efficiently reading into the buffer.
+	return w.body.ReadFrom(r)
 }
 
 // Hijack lets the caller take over the connection.
