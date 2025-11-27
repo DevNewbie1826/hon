@@ -1,6 +1,6 @@
 # Hon (혼)
 
-**Hon**은 [CloudWeGo Netpoll](https://github.com/cloudwego/netpoll) 기반의 고성능 HTTP 엔진 어댑터입니다.
+**Hon**은 [CloudWeGo Netpoll](https://github.com/cloudwego/netpoll) 기반의 고성능 HTTP 엔진 어댑터입니다. **Hon**은 "HTTP-over-Netpoll"의 약자입니다.
 
 Go 언어의 표준 `net/http` 인터페이스를 그대로 사용하면서, 이벤트 기반(epoll/kqueue)의 고성능 I/O 처리를 가능하게 합니다. 이를 통해 Gin, Chi, Echo 등 기존의 인기 있는 Go 웹 프레임워크를 코드 변경 없이 Netpoll 위에서 실행할 수 있습니다.
 
