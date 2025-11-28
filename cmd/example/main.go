@@ -48,7 +48,7 @@ func main() {
 	hon(mux, addr)
 }
 
-func hertz(mux http.Handler, addr string) {
+func newHertzServer(mux http.Handler, addr string) *server.Hertz {
 	hlog.SetLevel(hlog.LevelFatal)
 	// 2. Hertz 서버 생성
 	hertzServer := server.Default(
@@ -59,6 +59,11 @@ func hertz(mux http.Handler, addr string) {
 
 	// 3. Hertz 어댑터를 사용하여 Gin 엔진을 Hertz 핸들러로 래핑
 	hertzServer.Any("/*path", adaptor.HertzHandler(mux))
+	return hertzServer
+}
+
+func hertz(mux http.Handler, addr string) {
+	hertzServer := newHertzServer(mux, addr)
 
 	log.Printf("Hertz server running http.mux application on %s", addr)
 
@@ -66,20 +71,33 @@ func hertz(mux http.Handler, addr string) {
 	hertzServer.Spin()
 }
 
+func newStdServer(mux http.Handler, addr string) *http.Server {
+	return &http.Server{
+		Addr:    addr,
+		Handler: mux,
+	}
+}
+
 func std(mux http.Handler, addr string) {
+	srv := newStdServer(mux, addr)
 	log.Printf("Standard net/http server starting on %s...", addr)
-	if err := http.ListenAndServe(addr, mux); err != nil {
+	if err := srv.ListenAndServe(); err != nil {
 		log.Fatalf("Standard server failed: %v", err)
 	}
 }
 
-func hon(mux http.Handler, addr string) {
+func newHonServer(mux http.Handler, addr string) *hserver.Server {
 	eng := hengine.NewEngine(mux)
 
 	srv := hserver.NewServer(eng,
 		hserver.WithReadTimeout(10*time.Second),
 		hserver.WithWriteTimeout(10*time.Second),
 	)
+	return srv
+}
+
+func hon(mux http.Handler, addr string) {
+	srv := newHonServer(mux, addr)
 
 	log.Printf("Starting Hon server on %s", addr)
 	if err := srv.Serve(addr); err != nil {
