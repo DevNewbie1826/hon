@@ -7,22 +7,39 @@ import (
 	"io"
 	"net"
 	"net/http"
+	"strconv"
 	"sync"
+	"sync/atomic"
+	"time"
 
 	"github.com/DevNewbie1826/hon/pkg/appcontext"
 )
 
+// currentDate holds the cached Date header value.
+// currentDate는 캐시된 Date 헤더 값을 저장합니다.
+var currentDate atomic.Value
+
+func init() {
+	currentDate.Store(time.Now().UTC().Format(http.TimeFormat))
+	go func() {
+		ticker := time.NewTicker(1 * time.Second)
+		for range ticker.C {
+			currentDate.Store(time.Now().UTC().Format(http.TimeFormat))
+		}
+	}()
+}
+
 // ResponseWriter implements http.ResponseWriter and wraps netpoll connection.
 // ResponseWriter는 http.ResponseWriter 인터페이스를 구현하며 netpoll 연결을 래핑합니다.
 type ResponseWriter struct {
-	ctx          *appcontext.RequestContext
-	req          *http.Request
-	header       http.Header
-	statusCode   int
-	hijacked     bool
-	headerSent   bool
-	chunked      bool
-	bufWriter    *bufio.Writer // Buffering for efficient writes
+	ctx        *appcontext.RequestContext
+	req        *http.Request
+	header     http.Header
+	statusCode int
+	hijacked   bool
+	headerSent bool
+	chunked    bool
+	bufWriter  *bufio.Writer // Buffering for efficient writes
 }
 
 // rwPool recycles ResponseWriter objects to reduce GC pressure.
@@ -50,10 +67,9 @@ var bufWriterPool = sync.Pool{
 	New: func() any {
 		// Default bufio.Writer buffer size is 4KB.
 		// 기본 bufio.Writer 버퍼 크기는 4KB입니다.
-		return bufio.NewWriter(nil) 
+		return bufio.NewWriter(nil)
 	},
 }
-
 
 // NewResponseWriter retrieves a ResponseWriter from the pool and initializes it.
 // NewResponseWriter는 풀에서 ResponseWriter를 가져와 초기화합니다.
@@ -65,7 +81,7 @@ func NewResponseWriter(ctx *appcontext.RequestContext, req *http.Request) *Respo
 	w.hijacked = false
 	w.headerSent = false
 	w.chunked = false
-	
+
 	// Get bufio.Writer from pool and reset it with the current connection
 	// 풀에서 bufio.Writer를 가져와 현재 연결로 리셋합니다.
 	bw := bufWriterPool.Get().(*bufio.Writer)
@@ -94,9 +110,7 @@ func (w *ResponseWriter) Release() {
 
 	// Clear headers
 	// 헤더 초기화
-	for k := range w.header {
-		delete(w.header, k)
-	}
+	clear(w.header)
 
 	rwPool.Put(w)
 }
@@ -138,6 +152,12 @@ func (w *ResponseWriter) Write(p []byte) (int, error) {
 	}
 
 	if !w.headerSent {
+		// Sniff Content-Type if not set
+		// Content-Type이 설정되지 않았다면 감지합니다.
+		if w.header.Get("Content-Type") == "" {
+			w.header.Set("Content-Type", http.DetectContentType(p))
+		}
+
 		if err := w.ensureHeaderSent(); err != nil {
 			return 0, err
 		}
@@ -243,6 +263,12 @@ func (w *ResponseWriter) ensureHeaderSent() error {
 		return nil
 	}
 
+	// Set Date header if not present
+	// Date 헤더가 없으면 설정합니다.
+	if w.header.Get("Date") == "" {
+		w.header.Set("Date", currentDate.Load().(string))
+	}
+
 	// If Content-Length is not set, we must use chunked encoding because we are streaming.
 	// Content-Length가 설정되지 않았다면 스트리밍 중이므로 Chunked 인코딩을 사용해야 합니다.
 	if w.header.Get("Content-Length") == "" {
@@ -251,7 +277,7 @@ func (w *ResponseWriter) ensureHeaderSent() error {
 	} else {
 		w.chunked = false
 	}
-	
+
 	// Set Default Content-Type if not present
 	// Content-Type이 없으면 기본값(text/plain 또는 application/octet-stream)을 추론하기 어렵습니다.
 	// 표준 라이브러리는 Sniffing을 하지만 여기서는 생략하거나 기본값만 처리합니다.
@@ -259,9 +285,9 @@ func (w *ResponseWriter) ensureHeaderSent() error {
 
 	statusText := http.StatusText(w.statusCode)
 	if statusText == "" {
-		statusText = "status code " + fmt.Sprintf("%d", w.statusCode)
+		statusText = "status code " + strconv.Itoa(w.statusCode)
 	}
-	headerLine := fmt.Sprintf("HTTP/1.1 %d %s\r\n", w.statusCode, statusText)
+	headerLine := "HTTP/1.1 " + strconv.Itoa(w.statusCode) + " " + statusText + "\r\n"
 
 	if _, err := w.bufWriter.Write([]byte(headerLine)); err != nil {
 		return err

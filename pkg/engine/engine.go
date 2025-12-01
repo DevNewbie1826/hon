@@ -2,6 +2,7 @@ package engine
 
 import (
 	"context"
+	"errors"
 	"io"
 	"log"
 	"net/http"
@@ -65,7 +66,7 @@ func (e *Engine) ServeConn(ctx context.Context, conn netpoll.Connection) error {
 		// Body Draining: Read and discard remaining body data for the next request.
 		// Body Draining: 다음 요청을 위해 남은 바디 데이터를 읽어서 버립니다.
 		if req.Body != nil {
-			_, _ = io.Copy(io.Discard, req.Body)
+			_, _ = io.Copy(io.Discard, io.LimitReader(req.Body, 4096))
 			_ = req.Body.Close()
 		}
 
@@ -92,18 +93,19 @@ func (e *Engine) handleRequest(ctx *appcontext.RequestContext) (*http.Request, b
 
 	// Apply Request Timeout.
 	// 요청 타임아웃 적용.
-	var cancel context.CancelFunc
 	if e.requestTimeout > 0 {
-		var timeoutCtx context.Context
-		timeoutCtx, cancel = context.WithTimeout(req.Context(), e.requestTimeout)
+		timeoutCtx, cancel := context.WithTimeout(req.Context(), e.requestTimeout)
 		req = req.WithContext(timeoutCtx)
+		defer cancel()
 	}
 
 	// Panic Recovery
 	// 패닉 복구
+	var panicked bool
 	func() {
 		defer func() {
 			if r := recover(); r != nil {
+				panicked = true
 				log.Printf("[Panic] Recovered in handler: %v\n%s", r, debug.Stack())
 				respWriter.WriteHeader(http.StatusInternalServerError)
 			}
@@ -111,8 +113,8 @@ func (e *Engine) handleRequest(ctx *appcontext.RequestContext) (*http.Request, b
 		e.Handler.ServeHTTP(respWriter, req)
 	}()
 
-	if cancel != nil {
-		cancel()
+	if panicked {
+		return nil, false, errors.New("handler panicked")
 	}
 
 	err = respWriter.EndResponse()
