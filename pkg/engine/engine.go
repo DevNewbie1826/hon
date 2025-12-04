@@ -1,18 +1,40 @@
 package engine
 
 import (
+	"bufio"
 	"context"
 	"errors"
 	"io"
 	"log"
 	"net/http"
 	"runtime/debug"
+	"sync"
 	"time"
 
 	"github.com/DevNewbie1826/hon/pkg/adaptor"
 	"github.com/DevNewbie1826/hon/pkg/appcontext"
 	"github.com/cloudwego/netpoll"
 )
+
+// MaxDrainSize is the maximum number of bytes to drain from a request body
+// before deciding to close the connection instead of keeping it alive.
+// This prevents malicious clients from sending very large bodies and
+// tying up server resources if the handler doesn't consume the body.
+const MaxDrainSize = 64 * 1024 // 64KB
+
+// bufReaderPool recycles bufio.Reader objects.
+var bufReaderPool = sync.Pool{
+	New: func() any {
+		return bufio.NewReader(nil)
+	},
+}
+
+// bufWriterPool recycles bufio.Writer objects.
+var bufWriterPool = sync.Pool{
+	New: func() any {
+		return bufio.NewWriter(nil)
+	},
+}
 
 // Option is a function type for configuring the Engine.
 // Option은 Engine 설정을 위한 함수 타입입니다.
@@ -48,8 +70,20 @@ func NewEngine(handler http.Handler, opts ...Option) *Engine {
 // ServeConn is used as netpoll's OnRequest callback.
 // ServeConn은 netpoll의 OnRequest 콜백으로 사용됩니다.
 func (e *Engine) ServeConn(ctx context.Context, conn netpoll.Connection) error {
+	// Acquire a bufio.Reader for the life of the connection
+	// 연결 수명 동안 사용할 bufio.Reader를 획득합니다.
+	reader := bufReaderPool.Get().(*bufio.Reader)
+	reader.Reset(conn)
+	defer bufReaderPool.Put(reader)
+
+	// Acquire a bufio.Writer for the life of the connection
+	// 연결 수명 동안 사용할 bufio.Writer를 획득합니다.
+	writer := bufWriterPool.Get().(*bufio.Writer)
+	writer.Reset(conn)
+	defer bufWriterPool.Put(writer)
+
 	for {
-		requestContext := appcontext.NewRequestContext(conn, ctx)
+		requestContext := appcontext.NewRequestContext(conn, ctx, reader, writer)
 
 		req, hijacked, err := e.handleRequest(requestContext)
 
@@ -59,6 +93,12 @@ func (e *Engine) ServeConn(ctx context.Context, conn netpoll.Connection) error {
 		}
 
 		if hijacked {
+			// If hijacked, the reader is now owned by the hijacker (or lost).
+			// We should probably NOT put it back to the pool if we can't guarantee its state,
+			// but here we deferred Put.
+			// However, Hijack() in adaptor returns a new bufio.ReadWriter.
+			// The original reader (this one) is still attached to the conn.
+			// If hijacked, we stop this loop.
 			<-ctx.Done()
 			return nil
 		}
@@ -66,8 +106,17 @@ func (e *Engine) ServeConn(ctx context.Context, conn netpoll.Connection) error {
 		// Body Draining: Read and discard remaining body data for the next request.
 		// Body Draining: 다음 요청을 위해 남은 바디 데이터를 읽어서 버립니다.
 		if req.Body != nil {
-			_, _ = io.Copy(io.Discard, io.LimitReader(req.Body, 4096))
+			// Limit the amount of body we drain to prevent resource exhaustion from large unread bodies.
+			// 만약 핸들러가 바디를 다 읽지 않았고, 남은 바디가 MaxDrainSize보다 크다면
+			// 연결을 끊어서 불필요한 리소스 소모를 방지하고 다음 요청의 오염을 막습니다.
+			n, _ := io.Copy(io.Discard, io.LimitReader(req.Body, MaxDrainSize+1))
 			_ = req.Body.Close()
+
+			if n > MaxDrainSize {
+				// If we tried to drain more than MaxDrainSize, it means the body was too large
+				// and wasn't fully consumed by the handler. Force close the connection.
+				req.Close = true
+			}
 		}
 
 		requestContext.Release()

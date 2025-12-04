@@ -61,16 +61,6 @@ var copyBufPool = sync.Pool{
 	},
 }
 
-// bufWriterPool recycles bufio.Writer objects.
-// bufWriterPool은 bufio.Writer 객체를 재활용합니다.
-var bufWriterPool = sync.Pool{
-	New: func() any {
-		// Default bufio.Writer buffer size is 4KB.
-		// 기본 bufio.Writer 버퍼 크기는 4KB입니다.
-		return bufio.NewWriter(nil)
-	},
-}
-
 // NewResponseWriter retrieves a ResponseWriter from the pool and initializes it.
 // NewResponseWriter는 풀에서 ResponseWriter를 가져와 초기화합니다.
 func NewResponseWriter(ctx *appcontext.RequestContext, req *http.Request) *ResponseWriter {
@@ -82,11 +72,9 @@ func NewResponseWriter(ctx *appcontext.RequestContext, req *http.Request) *Respo
 	w.headerSent = false
 	w.chunked = false
 
-	// Get bufio.Writer from pool and reset it with the current connection
-	// 풀에서 bufio.Writer를 가져와 현재 연결로 리셋합니다.
-	bw := bufWriterPool.Get().(*bufio.Writer)
-	bw.Reset(w.ctx.Conn())
-	w.bufWriter = bw
+	// Get bufio.Writer from context (injected by engine)
+	// 컨텍스트에서 bufio.Writer를 가져옵니다 (엔진에 의해 주입됨).
+	w.bufWriter = w.ctx.GetWriter()
 
 	return w
 }
@@ -94,12 +82,9 @@ func NewResponseWriter(ctx *appcontext.RequestContext, req *http.Request) *Respo
 // Release returns the ResponseWriter and its resources to their respective pools.
 // Release는 ResponseWriter와 리소스를 각각의 풀로 반환합니다.
 func (w *ResponseWriter) Release() {
-	// Put bufWriter back to pool FIRST
-	// bufWriter를 먼저 풀에 반환합니다.
-	if w.bufWriter != nil {
-		bufWriterPool.Put(w.bufWriter)
-		w.bufWriter = nil // Avoid lingering pointer
-	}
+	// Note: w.bufWriter is managed by the Engine, so we don't Put it back here.
+	// 참고: w.bufWriter는 Engine에 의해 관리되므로, 여기서 반환하지 않습니다.
+	w.bufWriter = nil // Avoid lingering pointer
 
 	w.ctx = nil
 	w.req = nil
@@ -328,11 +313,14 @@ func (w *ResponseWriter) Hijack() (net.Conn, *bufio.ReadWriter, error) {
 
 	conn := w.ctx.Conn()
 	reader := w.ctx.GetReader()
-	// Create a new bufio.ReadWriter for the hijacked connection.
-	// 하이재킹된 연결을 위해 새로운 bufio.ReadWriter를 생성합니다.
-	hijackedBufWriter := bufio.NewWriter(conn) // Use a new writer for Hijack, don't reuse the pooled one
+	// Reuse the existing bufWriter which is managed by the Engine.
+	// Since the connection will be closed eventually, the Engine will reclaim it.
+	// Engine이 관리하는 기존 bufWriter를 재사용합니다.
+	// 연결이 결국 닫히게 되므로 Engine이 이를 회수할 것입니다.
+	writer := w.bufWriter
+	w.bufWriter = nil // Detach from ResponseWriter to prevent accidental use
 
-	return conn, bufio.NewReadWriter(reader, hijackedBufWriter), nil
+	return conn, bufio.NewReadWriter(reader, writer), nil
 }
 
 // Hijacked returns whether the connection has been hijacked.

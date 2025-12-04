@@ -14,6 +14,7 @@ type RequestContext struct {
 	conn   netpoll.Connection
 	req    context.Context // Parent context. // 부모 컨텍스트.
 	reader *bufio.Reader
+	writer *bufio.Writer
 }
 
 // pool recycles RequestContext objects to reduce GC pressure.
@@ -26,10 +27,12 @@ var pool = sync.Pool{
 
 // NewRequestContext retrieves and initializes a RequestContext from the pool.
 // NewRequestContext는 풀에서 RequestContext를 가져와 초기화합니다.
-func NewRequestContext(conn netpoll.Connection, parent context.Context) *RequestContext {
+func NewRequestContext(conn netpoll.Connection, parent context.Context, reader *bufio.Reader, writer *bufio.Writer) *RequestContext {
 	c := pool.Get().(*RequestContext)
 	c.conn = conn
 	c.req = parent
+	c.reader = reader
+	c.writer = writer
 	return c
 }
 
@@ -45,8 +48,8 @@ func (c *RequestContext) Release() {
 func (c *RequestContext) reset() {
 	c.conn = nil
 	c.req = nil
-	// reader is not nil-ed for reuse.
-	// reader는 재사용을 위해 nil로 설정하지 않습니다.
+	c.reader = nil
+	c.writer = nil
 }
 
 // Conn returns the netpoll.Connection.
@@ -64,10 +67,11 @@ func (c *RequestContext) Req() context.Context {
 // GetReader returns a reusable bufio.Reader.
 // GetReader는 재사용 가능한 bufio.Reader를 반환합니다.
 func (c *RequestContext) GetReader() *bufio.Reader {
-	if c.reader == nil {
-		c.reader = bufio.NewReader(c.conn)
-	} else {
-		c.reader.Reset(c.conn)
-	}
 	return c.reader
+}
+
+// GetWriter returns a reusable bufio.Writer.
+// GetWriter는 재사용 가능한 bufio.Writer를 반환합니다.
+func (c *RequestContext) GetWriter() *bufio.Writer {
+	return c.writer
 }
