@@ -3,7 +3,6 @@ package adaptor
 import (
 	"bufio"
 	"errors"
-	"fmt"
 	"io"
 	"net"
 	"net/http"
@@ -18,13 +17,16 @@ import (
 // currentDate holds the cached Date header value.
 // currentDate는 캐시된 Date 헤더 값을 저장합니다.
 var currentDate atomic.Value
+var crlf = []byte("\r\n")
+var chunkEnd = []byte("0\r\n\r\n")
 
 func init() {
-	currentDate.Store(time.Now().UTC().Format(http.TimeFormat))
+	// Truncate to the second to ensure consistent update on second boundary
+	currentDate.Store(time.Now().UTC().Truncate(time.Second).Format(http.TimeFormat))
 	go func() {
 		ticker := time.NewTicker(1 * time.Second)
 		for range ticker.C {
-			currentDate.Store(time.Now().UTC().Format(http.TimeFormat))
+			currentDate.Store(time.Now().UTC().Truncate(time.Second).Format(http.TimeFormat))
 		}
 	}()
 }
@@ -139,8 +141,13 @@ func (w *ResponseWriter) Write(p []byte) (int, error) {
 	if !w.headerSent {
 		// Sniff Content-Type if not set
 		// Content-Type이 설정되지 않았다면 감지합니다.
-		if w.header.Get("Content-Type") == "" {
-			w.header.Set("Content-Type", http.DetectContentType(p))
+		if w.header.Get("Content-Type") == "" && len(p) > 0 { // Only sniff if body exists
+			// http.DetectContentType only needs the first 512 bytes
+			sniffLen := len(p)
+			if sniffLen > 512 {
+				sniffLen = 512
+			}
+			w.header.Set("Content-Type", http.DetectContentType(p[:sniffLen]))
 		}
 
 		if err := w.ensureHeaderSent(); err != nil {
@@ -150,11 +157,23 @@ func (w *ResponseWriter) Write(p []byte) (int, error) {
 
 	if w.chunked {
 		// Chunk header
-		fmt.Fprintf(w.bufWriter, "%x\r\n", len(p))
+		var chunkHeaderBuf [20]byte // Small buffer on stack
+		hexLen := strconv.AppendInt(chunkHeaderBuf[:0], int64(len(p)), 16)
+		if _, err := w.bufWriter.Write(hexLen); err != nil {
+			return 0, err
+		}
+		if _, err := w.bufWriter.Write(crlf); err != nil {
+			return 0, err
+		}
 		// Chunk data
 		n, err := w.bufWriter.Write(p)
+		if err != nil {
+			return n, err // Return n and err even if writing trailer fails
+		}
 		// Chunk trailer
-		w.bufWriter.Write([]byte("\r\n"))
+		if _, err := w.bufWriter.Write(crlf); err != nil {
+			return n, err
+		}
 		return n, err
 	}
 
@@ -202,14 +221,23 @@ func (w *ResponseWriter) ReadFrom(r io.Reader) (n int64, err error) {
 			// bufWriter에 직접 씁니다.
 			if w.chunked {
 				// Chunk header
-				fmt.Fprintf(w.bufWriter, "%x\r\n", nr)
+				var chunkHeaderBuf [20]byte // Small buffer on stack
+				hexLen := strconv.AppendInt(chunkHeaderBuf[:0], int64(nr), 16)
+				if _, ew := w.bufWriter.Write(hexLen); ew != nil {
+					err = ew
+					break
+				}
+				if _, ew := w.bufWriter.Write(crlf); ew != nil {
+					err = ew
+					break
+				}
 				// Chunk data
 				if _, ew := w.bufWriter.Write(buf[:nr]); ew != nil {
 					err = ew
 					break
 				}
 				// Chunk trailer
-				if _, ew := w.bufWriter.Write([]byte("\r\n")); ew != nil {
+				if _, ew := w.bufWriter.Write(crlf); ew != nil {
 					err = ew
 					break
 				}
@@ -329,6 +357,12 @@ func (w *ResponseWriter) Hijacked() bool {
 	return w.hijacked
 }
 
+// HeaderSent returns whether the headers have already been sent.
+// HeaderSent는 헤더가 이미 전송되었는지 여부를 반환합니다.
+func (w *ResponseWriter) HeaderSent() bool {
+	return w.headerSent
+}
+
 // EndResponse serializes and writes the HTTP response to the connection.
 // EndResponse는 HTTP 응답을 직렬화하여 연결에 씁니다.
 func (w *ResponseWriter) EndResponse() error {
@@ -350,7 +384,7 @@ func (w *ResponseWriter) EndResponse() error {
 	// If chunked, send terminating chunk
 	// Chunked 인코딩인 경우 종료 청크 전송
 	if w.chunked {
-		if _, err := w.bufWriter.Write([]byte("0\r\n\r\n")); err != nil {
+		if _, err := w.bufWriter.Write(chunkEnd); err != nil {
 			return err
 		}
 	}

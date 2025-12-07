@@ -74,13 +74,21 @@ func (e *Engine) ServeConn(ctx context.Context, conn netpoll.Connection) error {
 	// 연결 수명 동안 사용할 bufio.Reader를 획득합니다.
 	reader := bufReaderPool.Get().(*bufio.Reader)
 	reader.Reset(conn)
-	defer bufReaderPool.Put(reader)
 
 	// Acquire a bufio.Writer for the life of the connection
 	// 연결 수명 동안 사용할 bufio.Writer를 획득합니다.
 	writer := bufWriterPool.Get().(*bufio.Writer)
 	writer.Reset(conn)
-	defer bufWriterPool.Put(writer)
+
+	// Flag to indicate if the connection was hijacked, to prevent returning reader/writer to pools.
+	// 연결이 하이재킹되었는지 여부를 나타내는 플래그. reader/writer를 풀에 반환하는 것을 방지합니다.
+	isHijackedConnection := false
+	defer func() {
+		if !isHijackedConnection {
+			bufReaderPool.Put(reader)
+			bufWriterPool.Put(writer)
+		}
+	}()
 
 	for {
 		requestContext := appcontext.NewRequestContext(conn, ctx, reader, writer)
@@ -93,6 +101,7 @@ func (e *Engine) ServeConn(ctx context.Context, conn netpoll.Connection) error {
 		}
 
 		if hijacked {
+			isHijackedConnection = true // Mark as hijacked, so pools are not reused
 			// If hijacked, the reader is now owned by the hijacker (or lost).
 			// We should probably NOT put it back to the pool if we can't guarantee its state,
 			// but here we deferred Put.
@@ -156,7 +165,17 @@ func (e *Engine) handleRequest(ctx *appcontext.RequestContext) (*http.Request, b
 			if r := recover(); r != nil {
 				panicked = true
 				log.Printf("[Panic] Recovered in handler: %v\n%s", r, debug.Stack())
-				respWriter.WriteHeader(http.StatusInternalServerError)
+				if respWriter.HeaderSent() {
+					// If headers were already sent, we cannot send a 500.
+					// Log the situation and let the connection be closed by returning an error from handleRequest.
+					log.Printf("[Panic] Headers already sent, cannot write 500 status. Forcing connection close.")
+				} else {
+					// If headers were not sent, we can still write a 500.
+					respWriter.WriteHeader(http.StatusInternalServerError)
+					// Ensure the response is ended if a panic occurs before EndResponse is called.
+					// This will ensure 500 header is sent and potentially an empty body.
+					_ = respWriter.EndResponse()
+				}
 			}
 		}()
 		e.Handler.ServeHTTP(respWriter, req)
