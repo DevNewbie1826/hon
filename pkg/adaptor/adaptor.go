@@ -12,7 +12,17 @@ import (
 	"time"
 
 	"github.com/DevNewbie1826/hon/pkg/appcontext"
+	"github.com/cloudwego/netpoll"
 )
+
+// ReadHandler is a function type for handling custom connection reads (e.g., WebSocket).
+type ReadHandler func(conn net.Conn, rw *bufio.ReadWriter) error
+
+// Hijacker is an interface that allows taking over the connection and setting a custom read handler.
+type Hijacker interface {
+	Hijack() (net.Conn, *bufio.ReadWriter, error)
+	SetReadHandler(handler ReadHandler)
+}
 
 // currentDate holds the cached Date header value.
 // currentDate는 캐시된 Date 헤더 값을 저장합니다.
@@ -269,32 +279,22 @@ func (w *ResponseWriter) WriteHeader(statusCode int) {
 	w.statusCode = statusCode
 }
 
+var (
+	headerDate          = []byte("Date: ")
+	headerContentLength = "Content-Length"
+	headerContentType   = "Content-Type"
+	headerTransferEnc   = "Transfer-Encoding"
+	headerConnection    = "Connection"
+
+	bytesTransferEncodingChunked = []byte("Transfer-Encoding: chunked\r\n")
+)
+
 // ensureHeaderSent sends headers if they haven't been sent yet.
 // ensureHeaderSent는 헤더가 아직 전송되지 않았다면 전송합니다.
 func (w *ResponseWriter) ensureHeaderSent() error {
 	if w.headerSent {
 		return nil
 	}
-
-	// Set Date header if not present
-	// Date 헤더가 없으면 설정합니다.
-	if w.header.Get("Date") == "" {
-		w.header.Set("Date", currentDate.Load().(string))
-	}
-
-	// If Content-Length is not set, we must use chunked encoding because we are streaming.
-	// Content-Length가 설정되지 않았다면 스트리밍 중이므로 Chunked 인코딩을 사용해야 합니다.
-	if w.header.Get("Content-Length") == "" {
-		w.chunked = true
-		w.header.Set("Transfer-Encoding", "chunked")
-	} else {
-		w.chunked = false
-	}
-
-	// Set Default Content-Type if not present
-	// Content-Type이 없으면 기본값(text/plain 또는 application/octet-stream)을 추론하기 어렵습니다.
-	// 표준 라이브러리는 Sniffing을 하지만 여기서는 생략하거나 기본값만 처리합니다.
-	// 여기서는 생략합니다. 사용자가 설정해야 합니다.
 
 	statusText := http.StatusText(w.statusCode)
 	if statusText == "" {
@@ -305,10 +305,48 @@ func (w *ResponseWriter) ensureHeaderSent() error {
 	if _, err := w.bufWriter.Write([]byte(headerLine)); err != nil {
 		return err
 	}
+
+	// Optimization: Write Date header directly to buffer if not present in map.
+	// This avoids map allocation/access overhead for every request.
+	if w.header.Get("Date") == "" {
+		if _, err := w.bufWriter.Write(headerDate); err != nil {
+			return err
+		}
+		if _, err := w.bufWriter.WriteString(currentDate.Load().(string)); err != nil {
+			return err
+		}
+		if _, err := w.bufWriter.Write(crlf); err != nil {
+			return err
+		}
+	}
+
+	// If Content-Length is not set, we must use chunked encoding because we are streaming.
+	// Content-Length가 설정되지 않았다면 스트리밍 중이므로 Chunked 인코딩을 사용해야 합니다.
+	if w.header.Get(headerContentLength) == "" {
+		w.chunked = true
+		// Optimization: Don't set in map to avoid allocation/hashing. We write it directly below.
+		// w.header.Set(headerTransferEnc, "chunked")
+	} else {
+		w.chunked = false
+	}
+
+	// Set Default Content-Type if not present
+	// Content-Type이 없으면 기본값(text/plain 또는 application/octet-stream)을 추론하기 어렵습니다.
+	// 표준 라이브러리는 Sniffing을 하지만 여기서는 생략하거나 기본값만 처리합니다.
+	// 여기서는 생략합니다. 사용자가 설정해야 합니다.
+
 	if err := w.header.Write(w.bufWriter); err != nil {
 		return err
 	}
-	if _, err := w.bufWriter.Write([]byte("\r\n")); err != nil {
+
+	// Fast Path: Write Transfer-Encoding directly
+	if w.chunked {
+		if _, err := w.bufWriter.Write(bytesTransferEncodingChunked); err != nil {
+			return err
+		}
+	}
+
+	if _, err := w.bufWriter.Write(crlf); err != nil {
 		return err
 	}
 	w.headerSent = true
@@ -348,13 +386,58 @@ func (w *ResponseWriter) Hijack() (net.Conn, *bufio.ReadWriter, error) {
 	writer := w.bufWriter
 	w.bufWriter = nil // Detach from ResponseWriter to prevent accidental use
 
-	return conn, bufio.NewReadWriter(reader, writer), nil
+	// Wrap the connection with BufferedConn to ensure libraries reading from
+	// net.Conn (skipping bufio.Reader) still get the buffered data.
+	wrappedConn := &BufferedConn{
+		Connection: conn,
+		Reader:     reader,
+	}
+
+	// Create a NEW bufio.Reader wrapping the BufferedConn.
+	// This breaks the potential recursion cycle if the consumer (e.g., coder/websocket)
+	// calls Reset(conn) on the returned bufio.Reader.
+	// Cycle avoided: newReader -> BufferedConn -> originalReader -> netpoll.Conn
+	newReader := bufio.NewReader(wrappedConn)
+
+	return wrappedConn, bufio.NewReadWriter(newReader, writer), nil
 }
+
+// BufferedConn wraps netpoll.Connection and a bufio.Reader.
+// It ensures that reads go through the bufio.Reader to avoid data loss
+// if the library using the connection bypasses the bufio.ReadWriter.
+type BufferedConn struct {
+	netpoll.Connection
+	Reader *bufio.Reader
+}
+
+// Read reads from the embedded bufio.Reader.
+func (c *BufferedConn) Read(p []byte) (n int, err error) {
+	// 1. First, drain any buffered data from the bufio.Reader
+	if c.Reader.Buffered() > 0 {
+		return c.Reader.Read(p)
+	}
+
+	// 2. Read directly from the underlying connection.
+	// Since the engine keeps the ServeConn handler active (blocking mode),
+	// netpoll will correctly feed data to this Read call.
+	return c.Connection.Read(p)
+}
+
 
 // Hijacked returns whether the connection has been hijacked.
 // Hijacked는 연결이 하이재킹되었는지 여부를 반환합니다.
 func (w *ResponseWriter) Hijacked() bool {
 	return w.hijacked
+}
+
+// SetReadHandler sets the custom read handler for the connection.
+func (w *ResponseWriter) SetReadHandler(h ReadHandler) {
+	if w.ctx == nil {
+		return
+	}
+	w.ctx.SetReadHandler(func(c netpoll.Connection, rw *bufio.ReadWriter) error {
+		return h(c, rw)
+	})
 }
 
 // HeaderSent returns whether the headers have already been sent.
@@ -392,4 +475,82 @@ func (w *ResponseWriter) EndResponse() error {
 	// Flush any remaining buffered data
 	// 버퍼링된 남은 데이터 플러시
 	return w.bufWriter.Flush()
+}
+
+// -----------------------------------------------------------------------------
+// Optional Interfaces Implementation for http.ResponseController & Compatibility
+// -----------------------------------------------------------------------------
+
+// Unwrap returns the underlying ResponseWriter.
+// Since this is the root writer, it returns nil.
+// Unwrap은 기반 ResponseWriter를 반환합니다. 이 객체가 루트이므로 nil을 반환합니다.
+func (w *ResponseWriter) Unwrap() http.ResponseWriter {
+	return nil
+}
+
+// SetReadDeadline sets the read deadline on the underlying connection.
+// Supported by http.ResponseController (Go 1.20+).
+func (w *ResponseWriter) SetReadDeadline(deadline time.Time) error {
+	if w.ctx == nil || w.ctx.Conn() == nil {
+		return errors.New("connection not available")
+	}
+	return w.ctx.Conn().SetReadDeadline(deadline)
+}
+
+// SetWriteDeadline sets the write deadline on the underlying connection.
+// Supported by http.ResponseController (Go 1.20+).
+func (w *ResponseWriter) SetWriteDeadline(deadline time.Time) error {
+	if w.ctx == nil || w.ctx.Conn() == nil {
+		return errors.New("connection not available")
+	}
+	return w.ctx.Conn().SetWriteDeadline(deadline)
+}
+
+// EnableFullDuplex indicates that the request handler will read from the request body
+// concurrently with writing the response body.
+// Supported by http.ResponseController (Go 1.21+).
+func (w *ResponseWriter) EnableFullDuplex() error {
+	// Hon engine supports full duplex by design (ServeConn loop vs Request Handler).
+	// However, usually hijacking is preferred for true full duplex protocols like WebSocket.
+	return nil
+}
+
+// CloseNotify implements http.CloseNotifier.
+// It returns a channel that receives a value when the client connection has gone away.
+// Deprecated: Use context.Context from http.Request instead.
+func (w *ResponseWriter) CloseNotify() <-chan bool {
+	ch := make(chan bool, 1)
+	if w.ctx == nil {
+		ch <- true
+		return ch
+	}
+	
+	// Use the request context's Done channel
+	go func() {
+		<-w.ctx.Req().Done()
+		ch <- true
+	}()
+	return ch
+}
+
+// WriteString implements io.StringWriter.
+// It optimizes writing strings without converting to byte slice.
+func (w *ResponseWriter) WriteString(s string) (int, error) {
+	if w.hijacked {
+		return 0, http.ErrHijacked
+	}
+	if !w.headerSent {
+		if err := w.ensureHeaderSent(); err != nil {
+			return 0, err
+		}
+	}
+	// bufio.Writer has WriteString, so we can use it directly if available.
+	// But our w.bufWriter is *bufio.Writer, so yes.
+	
+	if w.chunked {
+		// Use standard Write for chunked to reuse logic (overhead of conversion is minimal compared to chunking logic)
+		return w.Write([]byte(s))
+	}
+
+	return w.bufWriter.WriteString(s)
 }

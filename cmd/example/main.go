@@ -1,103 +1,77 @@
 package main
 
 import (
+	"bufio"
 	"flag"
 	"fmt"
+	"io"
 	"log"
+	"net"
 	"net/http"
 	"time"
 
+	"github.com/DevNewbie1826/hon/pkg/adaptor"
 	hengine "github.com/DevNewbie1826/hon/pkg/engine"
 	hserver "github.com/DevNewbie1826/hon/pkg/server"
-	"github.com/cloudwego/hertz/pkg/app/server"
-	"github.com/cloudwego/hertz/pkg/common/adaptor"
-	"github.com/cloudwego/hertz/pkg/common/hlog"
-	"github.com/lxzan/gws"
+
+	"github.com/cloudwego/netpoll"
+	"github.com/gobwas/ws"
+	"github.com/gobwas/ws/wsutil"
+	"github.com/gorilla/websocket"
 )
 
 func main() {
-	serverType := flag.String("type", "hon", "Server type: hon, hertz, std")
+	// Set up logging to standard output
+	log.SetFlags(log.LstdFlags | log.Lshortfile)
+
+	serverType := flag.String("type", "hon", "Server type: hon, std")
 	flag.Parse()
 
 	mux := http.NewServeMux()
 	mux.HandleFunc("/", rootHandler)
-	mux.HandleFunc("/file", fileHandler) // 파일 서빙 핸들러 등록
-	mux.HandleFunc("/sse", sseHandler)
-	mux.HandleFunc("/ws", func(writer http.ResponseWriter, request *http.Request) {
-		socket, err := upgrader.Upgrade(writer, request)
-		if err != nil {
-			log.Printf("WebSocket upgrade failed: %v", err)
-			return
-		}
-		go func() {
-			socket.ReadLoop()
-		}()
-	})
+	mux.HandleFunc("/file", fileHandler) // Restore file handler route
+	mux.HandleFunc("/sse", sseHandler)   // Restore SSE handler route
+
+	// 1. gobwas/ws Low-Level (Event-Driven) - Best Performance
+	mux.HandleFunc("/ws-gobwas-low", gobwasLowLevelHandler)
+
+	// 2. gobwas/ws High-Level (Event-Driven) - Easy & Efficient
+	mux.HandleFunc("/ws-gobwas-high", gobwasHighLevelHandler)
+
+	// 3. gorilla/websocket (Standard Loop) - Compatibility Mode
+	mux.HandleFunc("/ws-gorilla-std", gorillaStdHandler)
+
+	// 4. gorilla/websocket (Event-Driven) - Reactor Mode with Gorilla
+	mux.HandleFunc("/ws-gorilla-event", gorillaEventHandler)
 
 	addr := ":1826"
 
-	if *serverType == "hertz" {
-		hertz(mux, addr)
-		return
-	}
-
 	if *serverType == "std" {
 		std(mux, addr)
+		return
 	}
 
 	hon(mux, addr)
 }
 
-func newHertzServer(mux http.Handler, addr string) *server.Hertz {
-	hlog.SetLevel(hlog.LevelFatal)
-	// 2. Hertz 서버 생성
-	hertzServer := server.Default(
-		server.WithHostPorts(addr),
-		server.WithSenseClientDisconnection(true),
-	)
-	//hertzServer.NoHijackConnPool = true
-
-	// 3. Hertz 어댑터를 사용하여 Gin 엔진을 Hertz 핸들러로 래핑
-	hertzServer.Any("/*path", adaptor.HertzHandler(mux))
-	return hertzServer
-}
-
-func hertz(mux http.Handler, addr string) {
-	hertzServer := newHertzServer(mux, addr)
-
-	log.Printf("Hertz server running http.mux application on %s", addr)
-
-	// 4. Hertz 서버 시작
-	hertzServer.Spin()
-}
-
-func newStdServer(mux http.Handler, addr string) *http.Server {
-	return &http.Server{
+func std(mux http.Handler, addr string) {
+	srv := &http.Server{
 		Addr:    addr,
 		Handler: mux,
 	}
-}
-
-func std(mux http.Handler, addr string) {
-	srv := newStdServer(mux, addr)
 	log.Printf("Standard net/http server starting on %s...", addr)
 	if err := srv.ListenAndServe(); err != nil {
 		log.Fatalf("Standard server failed: %v", err)
 	}
 }
 
-func newHonServer(mux http.Handler, addr string) *hserver.Server {
+func hon(mux http.Handler, addr string) {
 	eng := hengine.NewEngine(mux)
 
 	srv := hserver.NewServer(eng,
 		hserver.WithReadTimeout(10*time.Second),
 		hserver.WithWriteTimeout(10*time.Second),
 	)
-	return srv
-}
-
-func hon(mux http.Handler, addr string) {
-	srv := newHonServer(mux, addr)
 
 	log.Printf("Starting Hon server on %s", addr)
 	if err := srv.Serve(addr); err != nil {
@@ -105,18 +79,30 @@ func hon(mux http.Handler, addr string) {
 	}
 }
 
-// rootHandler는 일반 HTTP 요청을 처리합니다.
 func rootHandler(w http.ResponseWriter, r *http.Request) {
-	fmt.Fprint(w, "Welcome! Try /sse endpoint.")
+	fmt.Fprint(w, `Welcome to Hon WebSocket Examples!
+Available endpoints:
+1. /ws-gobwas-low    (Low-Level Event-Driven)
+2. /ws-gobwas-high   (High-Level Event-Driven using wsutil)
+3. /ws-gorilla-std   (Standard Loop in Goroutine)
+4. /ws-gorilla-event (Gorilla on Reactor Pattern)
+5. /file             (File Serving)
+6. /sse              (Server-Sent Events)
+`)
 }
 
-// sseHandler는 Server-Sent Events를 스트리밍합니다.
+// sseHandler streams Server-Sent Events.
 func sseHandler(w http.ResponseWriter, r *http.Request) {
 	flusher, ok := w.(http.Flusher)
 	if !ok {
 		http.Error(w, "Streaming not supported", http.StatusInternalServerError)
 		return
 	}
+
+	// Disable write deadline for SSE as it is a long-lived connection.
+	// We use http.ResponseController (Go 1.20+) to control the underlying connection.
+	rc := http.NewResponseController(w)
+	_ = rc.SetWriteDeadline(time.Time{})
 
 	w.Header().Set("Content-Type", "text/event-stream")
 	w.Header().Set("Cache-Control", "no-cache")
@@ -133,47 +119,186 @@ func sseHandler(w http.ResponseWriter, r *http.Request) {
 			log.Println("Client disconnected from SSE")
 			return
 		case t := <-ticker.C:
-			// SSE 이벤트 데이터는 "data: 메시지\r\n\r\n" 형식으로 보냅니다.
 			fmt.Fprintf(w, "data: Server time is %v\r\n\r\n", t)
 			flusher.Flush()
 		}
 	}
 }
 
-// fileHandler는 파일을 서빙하며 sendfile을 활용합니다.
+// fileHandler serves a file using http.ServeFile.
 func fileHandler(w http.ResponseWriter, r *http.Request) {
-	// 예시로 현재 실행 중인 main.go 파일을 서빙합니다.
-	// 실제로는 대용량 비디오나 이미지를 서빙할 때 유용합니다.
-	http.ServeFile(w, r, "README.md")
+	// Serve the current main.go file as an example
+	http.ServeFile(w, r, "cmd/example/main.go")
 }
 
-var upgrader = gws.NewUpgrader(&Handler{}, &gws.ServerOption{
-	ParallelEnabled:   true,                                 // 병렬 메시지 처리
-	Recovery:          gws.Recovery,                         // 패닉 복구
-	PermessageDeflate: gws.PermessageDeflate{Enabled: true}, // 압축 활성화
-})
+// -------------------------------------------------------------------------
+// 1. gobwas/ws Low-Level (Event-Driven)
+// Direct control over frames and buffers. Maximum performance.
+// -------------------------------------------------------------------------
+func gobwasLowLevelHandler(w http.ResponseWriter, r *http.Request) {
+	_, _, _, err := ws.UpgradeHTTP(r, w) // conn is unused directly, use _
+	if err != nil {
+		log.Printf("[gobwas-low] upgrade error: %v", err)
+		return
+	}
+	log.Printf("[gobwas-low] Connected: %s", r.RemoteAddr)
 
-const (
-	PingInterval = 5 * time.Second
-	PingWait     = 10 * time.Second
-)
+	if hijacker, ok := w.(adaptor.Hijacker); ok {
+		hijacker.SetReadHandler(func(c net.Conn, rw *bufio.ReadWriter) error {
+			// Check if connection is active
+			if !c.(netpoll.Connection).IsActive() {
+				return io.EOF
+			}
 
-type Handler struct{}
+			// Read Header
+		header, err := ws.ReadHeader(rw.Reader)
+			if err != nil {
+				if err != io.EOF {
+					log.Printf("[gobwas-low] ReadHeader error: %v", err)
+				}
+				return err
+			}
 
-func (c *Handler) OnOpen(socket *gws.Conn) {
-	_ = socket.SetDeadline(time.Now().Add(PingInterval + PingWait))
+			// Read Payload
+			payload := make([]byte, header.Length)
+			_, err = io.ReadFull(rw.Reader, payload)
+			if err != nil {
+				log.Printf("[gobwas-low] ReadFull error: %v", err)
+				return err
+			}
+
+			// Unmask
+			if header.Masked {
+				ws.Cipher(payload, header.Mask, 0)
+			}
+
+			// Echo Logic
+			if header.OpCode == ws.OpText || header.OpCode == ws.OpBinary {
+				respHeader := ws.Header{
+					Fin:    true,
+					OpCode: header.OpCode,
+					Length: int64(len(payload)),
+				}
+				if err := ws.WriteHeader(rw.Writer, respHeader); err != nil {
+					return err
+				}
+				if _, err := rw.Writer.Write(payload); err != nil {
+					return err
+				}
+				if err := rw.Writer.Flush(); err != nil {
+					return err
+				}
+			} else if header.OpCode == ws.OpClose {
+				return io.EOF
+			}
+
+			return nil
+		})
+	}
 }
 
-func (c *Handler) OnClose(socket *gws.Conn, err error) {}
+// -------------------------------------------------------------------------
+// 2. gobwas/ws High-Level (Event-Driven)
+// Uses wsutil for convenience. Still Event-Driven.
+// -------------------------------------------------------------------------
+func gobwasHighLevelHandler(w http.ResponseWriter, r *http.Request) {
+	_, _, _, err := ws.UpgradeHTTP(r, w) // conn is unused directly, use _
+	if err != nil {
+		log.Printf("[gobwas-high] upgrade error: %v", err)
+		return
+	}
+	log.Printf("[gobwas-high] Connected: %s", r.RemoteAddr)
 
-func (c *Handler) OnPing(socket *gws.Conn, payload []byte) {
-	_ = socket.SetDeadline(time.Now().Add(PingInterval + PingWait))
-	_ = socket.WritePong(nil)
+	if hijacker, ok := w.(adaptor.Hijacker); ok {
+		hijacker.SetReadHandler(func(c net.Conn, rw *bufio.ReadWriter) error {
+			if !c.(netpoll.Connection).IsActive() {
+				return io.EOF
+			}
+
+			msg, op, err := wsutil.ReadClientData(rw) // Use rw (*bufio.ReadWriter)
+			if err != nil {
+				if err != io.EOF {
+					log.Printf("[gobwas-high] Read error: %v", err)
+				}
+				return err
+			}
+
+			err = wsutil.WriteServerMessage(rw, op, msg) // Use rw (*bufio.ReadWriter)
+			if err != nil {
+				log.Printf("[gobwas-high] Write error: %v", err)
+				return err
+			}
+			rw.Writer.Flush()
+
+			return nil
+		})
+	}
 }
 
-func (c *Handler) OnPong(socket *gws.Conn, payload []byte) {}
+// -------------------------------------------------------------------------
+// 3. gorilla/websocket (Standard Loop)
+// Compatible with existing code. Uses one goroutine per connection.
+// -------------------------------------------------------------------------
+var gorillaUpgrader = websocket.Upgrader{
+	CheckOrigin: func(r *http.Request) bool { return true },
+}
 
-func (c *Handler) OnMessage(socket *gws.Conn, message *gws.Message) {
-	defer message.Close()
-	socket.WriteMessage(message.Opcode, message.Bytes())
+func gorillaStdHandler(w http.ResponseWriter, r *http.Request) {
+	conn, err := gorillaUpgrader.Upgrade(w, r, nil)
+	if err != nil {
+		log.Printf("[gorilla-std] upgrade error: %v", err)
+		return
+	}
+	log.Printf("[gorilla-std] Connected: %s", r.RemoteAddr)
+
+	// Traditional Loop in a separate goroutine
+	go func() {
+		defer conn.Close()
+		for {
+			messageType, message, err := conn.ReadMessage()
+			if err != nil {
+				if websocket.IsUnexpectedCloseError(err, websocket.CloseGoingAway, websocket.CloseNormalClosure) {
+					log.Printf("[gorilla-std] Read error: %v", err)
+				}
+				return
+			}
+			if err := conn.WriteMessage(messageType, message); err != nil {
+				log.Printf("[gorilla-std] Write error: %v", err)
+				return
+			}
+		}
+	}()
+}
+
+// -------------------------------------------------------------------------
+// 4. gorilla/websocket (Event-Driven)
+// Using Gorilla library on Hon's Reactor Pattern. No per-conn goroutine.
+// -------------------------------------------------------------------------
+func gorillaEventHandler(w http.ResponseWriter, r *http.Request) {
+	conn, err := gorillaUpgrader.Upgrade(w, r, nil)
+	if err != nil {
+		log.Printf("[gorilla-event] upgrade error: %v", err)
+		return
+	}
+	log.Printf("[gorilla-event] Connected: %s", r.RemoteAddr)
+
+	if hijacker, ok := w.(adaptor.Hijacker); ok {
+		hijacker.SetReadHandler(func(c net.Conn, rw *bufio.ReadWriter) error {
+			// netpoll calls this when data is available.
+			// conn.ReadMessage() will read from the socket (mostly non-blocking or short blocking).
+			messageType, message, err := conn.ReadMessage()
+			if err != nil {
+				if websocket.IsUnexpectedCloseError(err, websocket.CloseGoingAway, websocket.CloseNormalClosure) {
+					log.Printf("[gorilla-event] Read error: %v", err)
+				}
+				return err
+			}
+
+			if err := conn.WriteMessage(messageType, message); err != nil {
+				log.Printf("[gorilla-event] Write error: %v", err)
+				return err
+			}
+			return nil
+		})
+	}
 }

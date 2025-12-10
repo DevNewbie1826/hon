@@ -8,13 +8,17 @@ import (
 	"github.com/cloudwego/netpoll"
 )
 
+// ReadHandler is a function type for handling custom connection reads (e.g., WebSocket).
+type ReadHandler func(conn netpoll.Connection, rw *bufio.ReadWriter) error
+
 // RequestContext holds all necessary information during the lifecycle of an HTTP request.
 // RequestContext는 HTTP 요청의 전체 생명주기 동안 필요한 모든 정보를 담습니다.
 type RequestContext struct {
-	conn   netpoll.Connection
-	req    context.Context // Parent context. // 부모 컨텍스트.
-	reader *bufio.Reader
-	writer *bufio.Writer
+	conn             netpoll.Connection
+	req              context.Context // Parent context. // 부모 컨텍스트.
+	reader           *bufio.Reader
+	writer           *bufio.Writer
+	onSetReadHandler func(ReadHandler)
 }
 
 // pool recycles RequestContext objects to reduce GC pressure.
@@ -36,6 +40,18 @@ func NewRequestContext(conn netpoll.Connection, parent context.Context, reader *
 	return c
 }
 
+// SetReadHandler sets the custom read handler for the connection.
+func (c *RequestContext) SetReadHandler(h ReadHandler) {
+	if c.onSetReadHandler != nil {
+		c.onSetReadHandler(h)
+	}
+}
+
+// SetOnSetReadHandler sets the callback to be called when SetReadHandler is invoked.
+func (c *RequestContext) SetOnSetReadHandler(cb func(ReadHandler)) {
+	c.onSetReadHandler = cb
+}
+
 // Release returns the RequestContext to the pool for reuse.
 // Release는 RequestContext를 풀에 반환하여 재사용할 수 있도록 합니다.
 func (c *RequestContext) Release() {
@@ -50,6 +66,7 @@ func (c *RequestContext) reset() {
 	c.req = nil
 	c.reader = nil
 	c.writer = nil
+	c.onSetReadHandler = nil
 }
 
 // Conn returns the netpoll.Connection.

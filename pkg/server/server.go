@@ -90,14 +90,26 @@ func (s *Server) Serve(addr string) error {
 				conn.SetWriteTimeout(s.writeTimeout)
 			}
 
-			ctx := context.Background()
-			ctx = cancelContext(ctx) // Creates and registers a cancellable context. // 취소 가능한 컨텍스트를 생성하고 등록합니다.
+			ctx, cancel := context.WithCancel(context.Background())
+
+			// Initialize ConnectionState and inject into context
+			state := &engine.ConnectionState{
+				ReadTimeout: s.readTimeout,
+				CancelFunc:  cancel,
+			}
+			ctx = context.WithValue(ctx, engine.CtxKeyConnectionState, state)
+
 			return ctx
 		}),
 		netpoll.WithOnDisconnect(func(ctx context.Context, connection netpoll.Connection) {
-			cancelFunc, ok := ctx.Value(ctxCancelKey).(context.CancelFunc)
-			if cancelFunc != nil && ok {
-				cancelFunc() // Cancels context on connection disconnect. // 연결이 끊어지면 컨텍스트를 취소합니다.
+			// Retrieve and release ConnectionState resources
+			if val := ctx.Value(engine.CtxKeyConnectionState); val != nil {
+				if state, ok := val.(*engine.ConnectionState); ok {
+					if state.CancelFunc != nil {
+						state.CancelFunc() // Cancels context on connection disconnect.
+					}
+					state.Release()
+				}
 			}
 		}),
 	}
@@ -122,12 +134,4 @@ func (s *Server) Shutdown(ctx context.Context) error {
 	return s.eventLoop.Shutdown(ctx)
 }
 
-type ctxCancelKeyStruct struct{}
 
-var ctxCancelKey = ctxCancelKeyStruct{}
-
-func cancelContext(ctx context.Context) context.Context {
-	ctx, cancel := context.WithCancel(ctx)
-	ctx = context.WithValue(ctx, ctxCancelKey, cancel)
-	return ctx
-}

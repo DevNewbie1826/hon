@@ -6,9 +6,10 @@ import (
 	"errors"
 	"io"
 	"log"
-	"net/http"
 	"runtime/debug"
 	"sync"
+	"sync/atomic" // atomic 패키지 임포트 추가
+	"net/http"
 	"time"
 
 	"github.com/DevNewbie1826/hon/pkg/adaptor"
@@ -35,6 +36,31 @@ var bufWriterPool = sync.Pool{
 		return bufio.NewWriter(nil)
 	},
 }
+
+// ConnectionState holds the state of a connection, including buffers and custom handler.
+type ConnectionState struct {
+	Reader      *bufio.Reader
+	Writer      *bufio.Writer
+	ReadHandler appcontext.ReadHandler
+	Processing  atomic.Bool // Atomic flag to prevent concurrent processing
+	ReadTimeout time.Duration
+	CancelFunc  context.CancelFunc
+}
+
+// Release returns the reader and writer to their respective pools.
+func (s *ConnectionState) Release() {
+	if s.Reader != nil {
+		bufReaderPool.Put(s.Reader)
+		s.Reader = nil
+	}
+	if s.Writer != nil {
+		bufWriterPool.Put(s.Writer)
+		s.Writer = nil
+	}
+}
+
+// CtxKeyConnectionState is the context key for retrieving ConnectionState.
+var CtxKeyConnectionState = struct{}{}
 
 // Option is a function type for configuring the Engine.
 // Option은 Engine 설정을 위한 함수 타입입니다.
@@ -70,71 +96,170 @@ func NewEngine(handler http.Handler, opts ...Option) *Engine {
 // ServeConn is used as netpoll's OnRequest callback.
 // ServeConn은 netpoll의 OnRequest 콜백으로 사용됩니다.
 func (e *Engine) ServeConn(ctx context.Context, conn netpoll.Connection) error {
-	// Acquire a bufio.Reader for the life of the connection
-	// 연결 수명 동안 사용할 bufio.Reader를 획득합니다.
-	reader := bufReaderPool.Get().(*bufio.Reader)
-	reader.Reset(conn)
+	stateVal := ctx.Value(CtxKeyConnectionState)
+	if stateVal == nil {
+		return errors.New("connection state not found")
+	}
+	state := stateVal.(*ConnectionState)
 
-	// Acquire a bufio.Writer for the life of the connection
-	// 연결 수명 동안 사용할 bufio.Writer를 획득합니다.
-	writer := bufWriterPool.Get().(*bufio.Writer)
-	writer.Reset(conn)
+	// Try to acquire processing lock
+	if !state.Processing.CompareAndSwap(false, true) {
+		return nil
+	}
 
-	// Flag to indicate if the connection was hijacked, to prevent returning reader/writer to pools.
-	// 연결이 하이재킹되었는지 여부를 나타내는 플래그. reader/writer를 풀에 반환하는 것을 방지합니다.
-	isHijackedConnection := false
-	defer func() {
-		if !isHijackedConnection {
-			bufReaderPool.Put(reader)
-			bufWriterPool.Put(writer)
-		}
-	}()
+	// Initialize buffers if they are not already set (reused from state)
+	if state.Reader == nil {
+		state.Reader = bufReaderPool.Get().(*bufio.Reader)
+		state.Reader.Reset(conn)
+	}
+	if state.Writer == nil {
+		state.Writer = bufWriterPool.Get().(*bufio.Writer)
+		state.Writer.Reset(conn)
+	}
 
+	// Dispatch to Custom ReadHandler (e.g., WebSocket) if set
+	if state.ReadHandler != nil {
+		// Run ReadHandler synchronously in the netpoll worker goroutine
+		func() {
+			defer func() {
+				if r := recover(); r != nil {
+					log.Printf("[Panic] Recovered in ReadHandler: %v\n%s", r, debug.Stack())
+					conn.Close()
+				}
+				state.Processing.Store(false)
+			}()
+			rw := bufio.NewReadWriter(state.Reader, state.Writer)
+			// We ignore the error here as the handler should handle it or close the connection
+			_ = state.ReadHandler(conn, rw)
+		}()
+		return nil
+	}
+
+	// Dispatch to HTTP Handler synchronously in the netpoll worker goroutine
+	e.serveHTTP(ctx, conn, state)
+
+	return nil
+}
+
+// serveHTTP handles HTTP requests in a goroutine.
+func (e *Engine) serveHTTP(ctx context.Context, conn netpoll.Connection, state *ConnectionState) {
+	// Loop to handle pipelined requests or buffered data
 	for {
-		requestContext := appcontext.NewRequestContext(conn, ctx, reader, writer)
+		// Check if connection is closed before processing
+		if !conn.IsActive() {
+			state.Processing.Store(false)
+			return
+		}
+
+		requestContext := appcontext.NewRequestContext(conn, ctx, state.Reader, state.Writer)
+		requestContext.SetOnSetReadHandler(func(h appcontext.ReadHandler) {
+			state.ReadHandler = h
+		})
 
 		req, hijacked, err := e.handleRequest(requestContext)
+		requestContext.Release() // Release context after use
 
 		if err != nil {
-			requestContext.Release()
-			return err
+			// Handle specific errors that might indicate no more data or closed connection
+			if err != io.EOF {
+				conn.Close()
+			}
+			state.Processing.Store(false)
+			return
 		}
 
 		if hijacked {
-			isHijackedConnection = true // Mark as hijacked, so pools are not reused
-			// If hijacked, the reader is now owned by the hijacker (or lost).
-			// We should probably NOT put it back to the pool if we can't guarantee its state,
-			// but here we deferred Put.
-			// However, Hijack() in adaptor returns a new bufio.ReadWriter.
-			// The original reader (this one) is still attached to the conn.
-			// If hijacked, we stop this loop.
-			<-ctx.Done()
-			return nil
+			// If hijacked, the connection is now under the control of the hijacker (or the ReadHandler if set).
+			// We stop standard HTTP processing for this connection.
+			
+			// Clear Deadlines for long-lived connections (WebSocket, etc.)
+			_ = conn.SetReadDeadline(time.Time{})
+			_ = conn.SetWriteDeadline(time.Time{})
+
+			if state.ReadHandler != nil {
+				// Event-Driven Hijack (e.g., gobwas/ws with ReadHandler)
+				// We MUST return from serveHTTP (and ServeConn) to allow netpoll to trigger
+				// ServeConn again when new data arrives.
+				// We release the lock so the next ServeConn call can proceed.
+				state.Processing.Store(false)
+				return
+			}
+
+			// Standard Hijack (e.g., gorilla/websocket with loop in separate goroutine)
+			// Important: We do NOT release the processing lock (state.Processing remains true).
+			// This prevents ServeConn from spawning new goroutines for this connection,
+			// effectively handing over exclusive control to the hijacker.
+			
+            // Wait until the connection is closed.
+            // Since we are running synchronously in ServeConn (netpoll worker),
+            // keeping this function alive ensures netpoll considers the connection active/busy.
+            // The hijacker (e.g., websocket library) will handle I/O in its own goroutine or loop.
+            <-ctx.Done() // Block here to keep the worker attached to this connection.
+			
+			state.Processing.Store(false)
+			return
 		}
 
 		// Body Draining: Read and discard remaining body data for the next request.
-		// Body Draining: 다음 요청을 위해 남은 바디 데이터를 읽어서 버립니다.
 		if req.Body != nil {
-			// Limit the amount of body we drain to prevent resource exhaustion from large unread bodies.
-			// 만약 핸들러가 바디를 다 읽지 않았고, 남은 바디가 MaxDrainSize보다 크다면
-			// 연결을 끊어서 불필요한 리소스 소모를 방지하고 다음 요청의 오염을 막습니다.
+			// Set a short deadline for draining to prevent blocking on slow clients
+			_ = conn.SetReadDeadline(time.Now().Add(500 * time.Millisecond))
+
+			// Limit the amount of body we drain to prevent resource exhaustion.
 			n, _ := io.Copy(io.Discard, io.LimitReader(req.Body, MaxDrainSize+1))
 			_ = req.Body.Close()
 
+			// Reset deadline
+			_ = conn.SetReadDeadline(time.Time{})
+
 			if n > MaxDrainSize {
-				// If we tried to drain more than MaxDrainSize, it means the body was too large
-				// and wasn't fully consumed by the handler. Force close the connection.
 				req.Close = true
 			}
 		}
 
-		requestContext.Release()
-
-		// Keep-alive logic: Decides whether to close the connection based on the request.
-		// keep-alive 로직: 요청에 따라 연결을 닫을지 결정합니다.
+		// Keep-alive logic
 		if req.Close || req.Header.Get("Connection") == "close" {
-			return nil
+			conn.Close()
+			state.Processing.Store(false)
+			return
 		}
+
+		// Restore ReadTimeout for the next request (Keep-Alive)
+		_ = conn.SetReadDeadline(time.Time{})
+		if state.ReadTimeout > 0 {
+			_ = conn.SetReadTimeout(state.ReadTimeout)
+		}
+
+		// Check if there is more data in the buffer to process immediately
+		if state.Reader.Buffered() > 0 {
+			continue
+		}
+
+		// Double-Check Locking logic to prevent event loss
+		// 1. Release the lock tentatively
+		state.Processing.Store(false)
+
+		// 2. Check buffer again immediately
+		hasData := state.Reader.Buffered() > 0
+		if !hasData {
+			if r := conn.Reader(); r != nil && r.Len() > 0 {
+				hasData = true
+			}
+		}
+
+		if hasData {
+			// New data arrived right after we checked! Try to re-acquire lock.
+			if state.Processing.CompareAndSwap(false, true) {
+				// Successfully re-acquired, continue processing
+				continue
+			}
+			// Failed to acquire: another goroutine (ServeConn) picked it up. Safe to exit.
+			return
+		}
+
+		// If no buffered data, we exit the loop.
+		// Netpoll will trigger ServeConn again when new data arrives at the socket.
+		return
 	}
 }
 
