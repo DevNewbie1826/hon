@@ -128,7 +128,7 @@ type Engine struct {
 func NewEngine(handler http.Handler, opts ...Option) *Engine {
 	e := &Engine{
 		Handler:      handler,
-		maxDrainSize: 64 * 1024, // Default 64KB
+		maxDrainSize: MaxDrainSize, // Default 64KB
 	}
 	for _, opt := range opts {
 		opt(e)
@@ -182,6 +182,7 @@ func (e *Engine) ServeConn(ctx context.Context, conn netpoll.Connection) error {
 			// 핸들러가 오류를 처리하거나 연결을 닫아야 하므로, 여기서 오류는 무시합니다.
 			if err := state.ReadHandler(conn, rw); err != nil {
 				log.Printf("ReadHandler error: %v", err)
+				conn.Close() // Ensure connection is closed on error
 			}
 		}()
 		return nil

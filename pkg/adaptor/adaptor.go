@@ -30,6 +30,7 @@ type Hijacker interface {
 var currentDate atomic.Value
 var crlf = []byte("\r\n") // CRLF (Carriage Return Line Feed) bytes. // CRLF (캐리지 리턴 라인 피드) 바이트입니다.
 var chunkEnd = []byte("0\r\n\r\n") // The terminating chunk for chunked transfer encoding. // 청크 전송 인코딩의 종료 청크입니다.
+var lastChunk = []byte("0\r\n")    // The last chunk indicator before trailers. // 트레일러 전의 마지막 청크 표시자입니다.
 
 func init() {
 	// Truncate to the second to ensure consistent update on second boundary
@@ -48,6 +49,7 @@ type ResponseWriter struct {
 	ctx        *appcontext.RequestContext // The request context for this response. // 이 응답에 대한 요청 컨텍스트입니다.
 	req        *http.Request              // The HTTP request associated with this response. // 이 응답과 관련된 HTTP 요청입니다.
 	header     http.Header                // The response headers. // 응답 헤더입니다.
+	trailer    http.Header                // The response trailers. // 응답 트레일러입니다.
 	statusCode int                        // The HTTP status code to be written. // 작성될 HTTP 상태 코드입니다.
 	hijacked   bool                       // Indicates if the connection has been hijacked. // 연결이 하이재킹되었는지 나타냅니다.
 	headerSent bool                       // Indicates if headers have already been sent. // 헤더가 이미 전송되었는지 나타냅니다.
@@ -61,6 +63,7 @@ var rwPool = sync.Pool{
 	New: func() any {
 		return &ResponseWriter{
 			header: make(http.Header),
+			trailer: make(http.Header),
 		}
 	},
 }
@@ -109,6 +112,7 @@ func (w *ResponseWriter) Release() {
 	// Clear headers
 	// 헤더를 초기화합니다.
 	clear(w.header)
+	clear(w.trailer)
 
 	rwPool.Put(w)
 }
@@ -136,10 +140,33 @@ func GetRequest(ctx *appcontext.RequestContext) (*http.Request, error) {
 	return req, nil
 }
 
-// Header returns the header map that will be sent by WriteHeader.
-// Header는 WriteHeader에 의해 전송될 헤더 맵을 반환합니다.
 func (w *ResponseWriter) Header() http.Header {
 	return w.header
+}
+
+// Trailer returns the trailer map that will be sent by EndResponse.
+// Trailer는 EndResponse에 의해 전송될 트레일러 맵을 반환합니다.
+func (w *ResponseWriter) Trailer() http.Header {
+	return w.trailer
+}
+
+func (w *ResponseWriter) writeChunkHeader(length int64) error {
+	var chunkHeaderBuf [20]byte // Small buffer on stack
+	hexLen := strconv.AppendInt(chunkHeaderBuf[:0], length, 16)
+	if _, err := w.bufWriter.Write(hexLen); err != nil {
+		return err
+	}
+	if _, err := w.bufWriter.Write(crlf); err != nil {
+		return err
+	}
+	return nil
+}
+
+// writeChunkTrailer writes the chunk trailer (CRLF) to the buffer.
+// writeChunkTrailer는 청크 트레일러(CRLF)를 버퍼에 씁니다.
+func (w *ResponseWriter) writeChunkTrailer() error {
+	_, err := w.bufWriter.Write(crlf)
+	return err
 }
 
 // Write writes the data to the connection as part of an HTTP reply.
@@ -173,22 +200,14 @@ func (w *ResponseWriter) Write(p []byte) (int, error) {
 	}
 
 	if w.chunked {
-		// Chunk header
-		var chunkHeaderBuf [20]byte // Small buffer on stack
-		hexLen := strconv.AppendInt(chunkHeaderBuf[:0], int64(len(p)), 16)
-		if _, err := w.bufWriter.Write(hexLen); err != nil {
+		if err := w.writeChunkHeader(int64(len(p))); err != nil {
 			return 0, err
 		}
-		if _, err := w.bufWriter.Write(crlf); err != nil {
-			return 0, err
-		}
-		// Chunk data
 		n, err := w.bufWriter.Write(p)
 		if err != nil {
-			return n, err // Return n and err even if writing trailer fails
+			return n, err
 		}
-		// Chunk trailer
-		if _, err := w.bufWriter.Write(crlf); err != nil {
+		if err := w.writeChunkTrailer(); err != nil {
 			return n, err
 		}
 		return n, err
@@ -295,8 +314,10 @@ var (
 	headerTransferEnc   = "Transfer-Encoding"          // HTTP Transfer-Encoding header key. // HTTP Transfer-Encoding 헤더 키입니다.
 	headerConnection    = "Connection"                 // HTTP Connection header key. // HTTP Connection 헤더 키입니다.
 	
-	bytesTransferEncodingChunked = []byte("Transfer-Encoding: chunked\r\n") // Pre-computed bytes for chunked transfer encoding header. // 청크 전송 인코딩 헤더를 위한 미리 계산된 바이트입니다.
+	bytesTransferEncodingChunked = []byte("Transfer-Encoding: chunked\r\n")        // Pre-computed bytes for chunked transfer encoding header.
+	bytesTransferEncodingChunkedTrailers = []byte("Transfer-Encoding: chunked, trailers\r\n") // Pre-computed bytes for chunked + trailers transfer encoding header.
 )
+
 // ensureHeaderSent sends headers if they haven't been sent yet.
 // ensureHeaderSent는 헤더가 아직 전송되지 않았다면 전송합니다.
 func (w *ResponseWriter) ensureHeaderSent() error {
@@ -328,12 +349,12 @@ func (w *ResponseWriter) ensureHeaderSent() error {
 		}
 	}
 
+	hasTrailers := len(w.trailer) > 0
+
 	// If Content-Length is not set, we must use chunked encoding because we are streaming.
-	// Content-Length가 설정되지 않았다면 스트리밍 중이므로 Chunked 인코딩을 사용해야 합니다.
-	if w.header.Get(headerContentLength) == "" {
+	if w.header.Get(headerContentLength) == "" || hasTrailers {
 		w.chunked = true
-		// Optimization: Don't set in map to avoid allocation/hashing. We write it directly below.
-		// w.header.Set(headerTransferEnc, "chunked")
+		// If Content-Length is explicitly set, but trailers are present, we still enforce chunked encoding.
 	} else {
 		w.chunked = false
 	}
@@ -349,8 +370,14 @@ func (w *ResponseWriter) ensureHeaderSent() error {
 
 	// Fast Path: Write Transfer-Encoding directly
 	if w.chunked && w.header.Get(headerTransferEnc) == "" {
-		if _, err := w.bufWriter.Write(bytesTransferEncodingChunked); err != nil {
-			return err
+		if hasTrailers {
+			if _, err := w.bufWriter.Write(bytesTransferEncodingChunkedTrailers); err != nil {
+				return err
+			}
+		} else {
+			if _, err := w.bufWriter.Write(bytesTransferEncodingChunked); err != nil {
+				return err
+			}
 		}
 	}
 
@@ -488,10 +515,24 @@ func (w *ResponseWriter) EndResponse() error {
 	}
 
 	// If chunked, send terminating chunk
-	// Chunked 인코딩인 경우 종료 청크를 전송합니다.
 	if w.chunked {
-		if _, err := w.bufWriter.Write(chunkEnd); err != nil {
-			return err
+		if len(w.trailer) > 0 {
+			// Write last chunk "0\r\n"
+			if _, err := w.bufWriter.Write(lastChunk); err != nil {
+				return err
+			}
+			// Write trailers
+			if err := w.trailer.Write(w.bufWriter); err != nil {
+				return err
+			}
+			// Write final CRLF
+			if _, err := w.bufWriter.Write(crlf); err != nil {
+				return err
+			}
+		} else {
+			if _, err := w.bufWriter.Write(chunkEnd); err != nil {
+				return err
+			}
 		}
 	}
 
@@ -583,35 +624,32 @@ func (w *ResponseWriter) WriteString(s string) (int, error) {
 	}
 
 	if !w.headerSent {
+		// Sniff Content-Type if not set
+		if w.header.Get("Content-Type") == "" && len(s) > 0 {
+			// http.DetectContentType only needs the first 512 bytes
+			sniffLen := len(s)
+			if sniffLen > 512 {
+				sniffLen = 512
+			}
+			w.header.Set("Content-Type", http.DetectContentType([]byte(s[:sniffLen])))
+		}
 		if err := w.ensureHeaderSent(); err != nil {
 			return 0, err
 		}
 	}
-	// bufio.Writer has WriteString, so we can use it directly if available.
 	// But our w.bufWriter is *bufio.Writer, so yes.
 	// bufio.Writer는 WriteString을 가지고 있으므로, 사용 가능하다면 직접 사용할 수 있습니다.
 	// w.bufWriter는 *bufio.Writer이므로 가능합니다.
 
 	if w.chunked {
-		// Optimization: Avoid conversion to []byte by writing chunk parts directly.
-		// 최적화: 청크 파트를 직접 작성하여 []byte로의 변환을 피합니다.
-		
-		// Chunk header
-		var chunkHeaderBuf [20]byte
-		hexLen := strconv.AppendInt(chunkHeaderBuf[:0], int64(len(s)), 16)
-		if _, err := w.bufWriter.Write(hexLen); err != nil {
+		if err := w.writeChunkHeader(int64(len(s))); err != nil {
 			return 0, err
 		}
-		if _, err := w.bufWriter.Write(crlf); err != nil {
-			return 0, err
-		}
-		// Chunk data
 		n, err := w.bufWriter.WriteString(s)
 		if err != nil {
 			return n, err
 		}
-		// Chunk trailer
-		if _, err := w.bufWriter.Write(crlf); err != nil {
+		if err := w.writeChunkTrailer(); err != nil {
 			return n, err
 		}
 		return n, err
