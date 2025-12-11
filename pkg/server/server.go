@@ -13,11 +13,11 @@ import (
 // Server is the top-level structure for the netpoll server.
 // Server는 netpoll 서버의 최상위 구조체입니다.
 type Server struct {
-	Engine           *engine.Engine
-	eventLoop        netpoll.EventLoop
-	keepAliveTimeout time.Duration
-	readTimeout      time.Duration
-	writeTimeout     time.Duration
+	Engine           *engine.Engine    // The request processing engine. // 요청 처리 엔진입니다.
+	eventLoop        netpoll.EventLoop // The netpoll event loop. // netpoll 이벤트 루프입니다.
+	keepAliveTimeout time.Duration     // Timeout for idle connections. // 유휴 연결에 대한 타임아웃입니다.
+	readTimeout      time.Duration     // Timeout for reading request data. // 요청 데이터 읽기에 대한 타임아웃입니다.
+	writeTimeout     time.Duration     // Timeout for writing response data. // 응답 데이터 쓰기에 대한 타임아웃입니다.
 }
 
 // Option is a function type for configuring the Server.
@@ -85,7 +85,9 @@ func (s *Server) Serve(addr string) error {
 	opts := []netpoll.Option{
 		netpoll.WithIdleTimeout(s.keepAliveTimeout),
 		netpoll.WithOnPrepare(func(conn netpoll.Connection) context.Context {
-			conn.SetReadTimeout(s.readTimeout) // nolint:errcheck
+			if err := conn.SetReadTimeout(s.readTimeout); err != nil { // nolint:errcheck
+				log.Printf("Failed to set read timeout: %v", err)
+			}
 			if s.writeTimeout > 0 {
 				conn.SetWriteTimeout(s.writeTimeout)
 			}
@@ -93,20 +95,20 @@ func (s *Server) Serve(addr string) error {
 			ctx, cancel := context.WithCancel(context.Background())
 
 			// Initialize ConnectionState and inject into context
-			state := &engine.ConnectionState{
-				ReadTimeout: s.readTimeout,
-				CancelFunc:  cancel,
-			}
+			// ConnectionState를 초기화하고 컨텍스트에 주입합니다.
+			// Use NewConnectionState to recycle objects from the pool.
+			state := engine.NewConnectionState(s.readTimeout, cancel)
 			ctx = context.WithValue(ctx, engine.CtxKeyConnectionState, state)
 
 			return ctx
 		}),
 		netpoll.WithOnDisconnect(func(ctx context.Context, connection netpoll.Connection) {
 			// Retrieve and release ConnectionState resources
+			// ConnectionState 리소스를 검색하고 해제합니다.
 			if val := ctx.Value(engine.CtxKeyConnectionState); val != nil {
 				if state, ok := val.(*engine.ConnectionState); ok {
 					if state.CancelFunc != nil {
-						state.CancelFunc() // Cancels context on connection disconnect.
+						state.CancelFunc() // Cancels context on connection disconnect. // 연결이 끊어지면 컨텍스트를 취소합니다.
 					}
 					state.Release()
 				}
