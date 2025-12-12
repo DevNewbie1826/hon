@@ -151,7 +151,7 @@ func gobwasLowLevelHandler(w http.ResponseWriter, r *http.Request) {
 			}
 
 			// Read Header
-		header, err := ws.ReadHeader(rw.Reader)
+			header, err := ws.ReadHeader(rw.Reader)
 			if err != nil {
 				if err != io.EOF {
 					log.Printf("[gobwas-low] ReadHeader error: %v", err)
