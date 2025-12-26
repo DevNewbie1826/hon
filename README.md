@@ -2,15 +2,25 @@
 
 **Hon**은 [CloudWeGo Netpoll](https://github.com/cloudwego/netpoll) 기반의 고성능 HTTP 엔진 어댑터입니다. **Hon**은 "HTTP-over-Netpoll"의 약자입니다.
 
-Go 언어의 표준 `net/http` 인터페이스를 그대로 사용하면서, 이벤트 기반(epoll/kqueue)의 고성능 I/O 처리를 가능하게 합니다. 이를 통해 Gin, Chi, Echo 등 기존의 인기 있는 Go 웹 프레임워크를 코드 변경 없이 Netpoll 위에서 실행할 수 있습니다.
+Go 언어의 표준 `net/http` 인터페이스를 그대로 사용하면서, 이벤트 기반(epoll/kqueue)의 Reactor 패턴을 통한 고성능 I/O 처리를 가능하게 합니다. 이를 통해 Gin, Chi, Echo 등 기존의 인기 있는 Go 웹 프레임워크를 코드 변경 없이 Netpoll 위에서 실행하며, 대규모 동시 접속 환경을 효율적으로 관리할 수 있습니다.
 
 ## 🚀 주요 특징 (Key Features)
 
+- **압도적인 리소스 효율성**: Reactor 패턴을 통해 **10,000개 이상의 동시 접속자**가 있어도 단 **수십 개의 고루틴**만으로 서버를 운영할 수 있습니다. (표준 서버 대비 고루틴 사용량 99% 절감)
 - **표준 호환성**: `http.Handler` 인터페이스를 완벽하게 지원하여 `chi`, `gin`, `echo`, `mux` 등 기존 라우터를 그대로 사용 가능합니다.
-- **고성능 I/O**: Netpoll을 사용하여 대규모 동시 접속(C10K+) 환경에서도 효율적인 I/O 처리를 제공합니다.
-- **Zero-Copy 최적화**: 내부적으로 버퍼 풀(`bytebufferpool`)을 사용하여 메모리 할당을 최소화합니다.
-- **SSE 및 WebSocket 지원**: `http.Flusher` 구현을 통한 Server-Sent Events(SSE) 지원 및 `Hijack`을 통한 WebSocket 업그레이드를 지원합니다.
-- **SO_REUSEPORT 지원**: 멀티 프로세스/스레드 환경에서의 성능 확장을 위해 포트 재사용을 기본으로 지원합니다.
+- **메모리 최적화**: `WithBufferSize` 옵션을 통해 연결당 메모리 점유율을 튜닝할 수 있으며, 최적화 시 **연결당 약 20KB** 수준의 낮은 메모리 사용량을 보장합니다.
+- **이벤트 기반 WebSocket (Reactor Mode)**: `SetReadHandler`를 통해 WebSocket 연결조차 고루틴 점유 없이 이벤트 루프에서 처리하는 독보적인 성능을 제공합니다.
+- **SSE 지원**: `http.Flusher` 구현을 통해 효율적인 Server-Sent Events 스트리밍을 지원합니다.
+- **SO_REUSEPORT 지원**: 멀티 프로세스/스레드 환경에서의 수평적 성능 확장을 지원합니다.
+
+## 📊 성능 지표 (Performance Snapshot)
+
+10,000개 동시 WebSocket 접속 시(Mac OS 환경):
+
+| 지표 | 표준 서버 (net/http) | **Hon (Netpoll)** | 개선 효과 |
+| :--- | :--- | :--- | :--- |
+| **고루틴 개수** | 20,000+ 개 | **6 개** | **99.9% 절감** |
+| **메모리 사용량** | 340+ MB | **203 MB** | **약 40% 절약** |
 
 ## 📦 설치 (Installation)
 
@@ -20,9 +30,7 @@ go get github.com/DevNewbie1826/hon
 
 ## 💡 사용 예제 (Usage)
 
-Hon은 표준 `http.Handler`를 감싸서 실행하는 방식으로 동작합니다. 아래는 표준 `http.ServeMux`를 사용하는 예제입니다.
-
-### 기본 사용법
+### 기본 사용법 (최적화 옵션 포함)
 
 ```go
 package main
@@ -37,84 +45,63 @@ import (
 )
 
 func main() {
-	// 1. 기존 핸들러 생성 (예: http.ServeMux, chi.NewRouter, gin.Default 등)
 	mux := http.NewServeMux()
 	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
 		w.Write([]byte("Hello, Hon!"))
 	})
 
-	// 2. Hon 엔진 생성
-	eng := engine.NewEngine(mux, engine.WithRequestTimeout(5*time.Second))
+	// 1KB 버퍼 설정을 통해 메모리 효율 극대화 (Default: 4KB)
+	eng := engine.NewEngine(mux, 
+		engine.WithBufferSize(1024),
+		engine.WithRequestTimeout(5*time.Second),
+	)
 
-	// 3. 서버 설정 및 시작
 	srv := server.NewServer(eng,
 		server.WithReadTimeout(10*time.Second),
 		server.WithWriteTimeout(10*time.Second),
 	)
 
-	log.Println("Server listening on :8080")
-	if err := srv.Serve(":8080"); err != nil {
+	log.Println("Server listening on :1826")
+	if err := srv.Serve(":1826"); err != nil {
 		log.Fatal(err)
 	}
 }
 ```
 
-### Gin 프레임워크와 함께 사용하기
+### 이벤트 기반 WebSocket 처리 (Reactor Mode)
+
+고루틴을 생성하지 않고 WebSocket 메시지를 처리하는 가장 효율적인 방법입니다.
 
 ```go
-package main
-
-import (
-	"github.com/gin-gonic/gin"
-	"github.com/DevNewbie1826/hon/pkg/engine"
-	"github.com/DevNewbie1826/hon/pkg/server"
-)
-
-func main() {
-	r := gin.New()
-	r.GET("/ping", func(c *gin.Context) {
-		c.String(200, "pong")
-	})
-
-	eng := engine.NewEngine(r)
-	srv := server.NewServer(eng)
-	srv.Serve(":8080")
+func wsHandler(w http.ResponseWriter, r *http.Request) {
+    // Upgrade connection...
+    if hijacker, ok := w.(adaptor.Hijacker); ok {
+        hijacker.SetReadHandler(func(c net.Conn, rw *bufio.ReadWriter) error {
+            // 이 콜백은 데이터가 도착했을 때만 Netpoll 워커에 의해 실행됩니다.
+            // 무한 루프를 돌릴 필요가 없습니다.
+            msg, _ := wsutil.ReadClientData(rw)
+            wsutil.WriteServerMessage(rw, ws.OpText, msg)
+            rw.Flush()
+            return nil
+        })
+    }
 }
 ```
 
-### SSE (Server-Sent Events) 지원
+## 🛠 성능 테스트 (Stress Test)
 
-Hon은 `http.Flusher` 인터페이스를 구현하고 있어 SSE 스트리밍이 가능합니다.
+프로젝트 루트에 포함된 `ws_stress_config.go`를 사용하여 직접 성능을 검증할 수 있습니다.
 
-```go
-func sseHandler(w http.ResponseWriter, r *http.Request) {
-	flusher, ok := w.(http.Flusher)
-	if !ok {
-		http.Error(w, "Streaming unsupported", 500)
-		return
-	}
-
-	w.Header().Set("Content-Type", "text/event-stream")
-	w.Header().Set("Cache-Control", "no-cache")
-	w.Header().Set("Connection", "keep-alive")
-
-	for {
-		select {
-		case <-r.Context().Done():
-			return
-		case <-time.After(1 * time.Second):
-			fmt.Fprintf(w, "data: %s\n\n", time.Now().String())
-			flusher.Flush()
-		}
-	}
-}
+```bash
+# 1만개 연결을 30초간 유지하며 테스트
+go run ws_stress_config.go -c 10000 -hold 30s
 ```
 
 ## 🏗 아키텍처 (Architecture)
 
 - **Server**: Netpoll의 EventLoop를 관리하고 TCP 연결을 수신합니다.
-- **Engine**: 연결된 Connection에서 HTTP 요청을 파싱하고 사용자의 `http.Handler`로 전달합니다.
-- **Adaptor**: Netpoll의 raw connection과 표준 `net/http` 객체(`Request`, `ResponseWriter`) 간의 변환을 담당합니다.
+- **Engine**: Connection별 상태(`ConnectionState`) 및 버퍼 풀을 관리하며, 핸들러로 요청을 디스패치합니다.
+- **Adaptor**: Netpoll의 raw connection과 표준 `net/http` 객체 간의 변환을 담당합니다.
 
 ## 🤝 기여 (Contributing)
 

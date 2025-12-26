@@ -8,6 +8,7 @@ import (
 	"log"
 	"net"
 	"net/http"
+	_ "net/http/pprof" // Import for profiling
 	"time"
 
 	"github.com/DevNewbie1826/hon/pkg/adaptor"
@@ -23,6 +24,15 @@ import (
 func main() {
 	// Set up logging to standard output
 	log.SetFlags(log.LstdFlags | log.Lshortfile)
+
+	// Start pprof server for profiling in a separate goroutine
+	go func() {
+		pprofAddr := "localhost:6060"
+		log.Printf("Starting pprof server on %s", pprofAddr)
+		if err := http.ListenAndServe(pprofAddr, nil); err != nil {
+			log.Printf("pprof server failed: %v", err)
+		}
+	}()
 
 	serverType := flag.String("type", "hon", "Server type: hon, std")
 	flag.Parse()
@@ -66,7 +76,8 @@ func std(mux http.Handler, addr string) {
 }
 
 func hon(mux http.Handler, addr string) {
-	eng := hengine.NewEngine(mux)
+	// 1KB buffer size for optimization
+	eng := hengine.NewEngine(mux, hengine.WithBufferSize(1024))
 
 	srv := hserver.NewServer(eng,
 		hserver.WithReadTimeout(10*time.Second),
@@ -141,7 +152,7 @@ func gobwasLowLevelHandler(w http.ResponseWriter, r *http.Request) {
 		log.Printf("[gobwas-low] upgrade error: %v", err)
 		return
 	}
-	log.Printf("[gobwas-low] Connected: %s", r.RemoteAddr)
+	//log.Printf("[gobwas-low] Connected: %s", r.RemoteAddr)
 
 	if hijacker, ok := w.(adaptor.Hijacker); ok {
 		hijacker.SetReadHandler(func(c net.Conn, rw *bufio.ReadWriter) error {
@@ -173,7 +184,8 @@ func gobwasLowLevelHandler(w http.ResponseWriter, r *http.Request) {
 			}
 
 			// Echo Logic
-			if header.OpCode == ws.OpText || header.OpCode == ws.OpBinary {
+			switch header.OpCode {
+			case ws.OpText, ws.OpBinary:
 				respHeader := ws.Header{
 					Fin:    true,
 					OpCode: header.OpCode,
@@ -188,7 +200,7 @@ func gobwasLowLevelHandler(w http.ResponseWriter, r *http.Request) {
 				if err := rw.Writer.Flush(); err != nil {
 					return err
 				}
-			} else if header.OpCode == ws.OpClose {
+			case ws.OpClose:
 				return io.EOF
 			}
 
@@ -207,7 +219,7 @@ func gobwasHighLevelHandler(w http.ResponseWriter, r *http.Request) {
 		log.Printf("[gobwas-high] upgrade error: %v", err)
 		return
 	}
-	log.Printf("[gobwas-high] Connected: %s", r.RemoteAddr)
+	//log.Printf("[gobwas-high] Connected: %s", r.RemoteAddr)
 
 	if hijacker, ok := w.(adaptor.Hijacker); ok {
 		hijacker.SetReadHandler(func(c net.Conn, rw *bufio.ReadWriter) error {
@@ -249,7 +261,7 @@ func gorillaStdHandler(w http.ResponseWriter, r *http.Request) {
 		log.Printf("[gorilla-std] upgrade error: %v", err)
 		return
 	}
-	log.Printf("[gorilla-std] Connected: %s", r.RemoteAddr)
+	//log.Printf("[gorilla-std] Connected: %s", r.RemoteAddr)
 
 	// Traditional Loop in a separate goroutine
 	go func() {
@@ -280,7 +292,7 @@ func gorillaEventHandler(w http.ResponseWriter, r *http.Request) {
 		log.Printf("[gorilla-event] upgrade error: %v", err)
 		return
 	}
-	log.Printf("[gorilla-event] Connected: %s", r.RemoteAddr)
+	//log.Printf("[gorilla-event] Connected: %s", r.RemoteAddr)
 
 	if hijacker, ok := w.(adaptor.Hijacker); ok {
 		hijacker.SetReadHandler(func(c net.Conn, rw *bufio.ReadWriter) error {

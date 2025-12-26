@@ -110,7 +110,8 @@ func (s *Server) Serve(addr string) error {
 					if state.CancelFunc != nil {
 						state.CancelFunc() // Cancels context on connection disconnect. // 연결이 끊어지면 컨텍스트를 취소합니다.
 					}
-					state.Release()
+					// Return buffers to the Engine's pool and state to global pool
+					s.Engine.ReleaseConnectionState(state)
 				}
 			}
 		}),

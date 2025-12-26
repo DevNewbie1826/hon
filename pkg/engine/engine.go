@@ -6,10 +6,10 @@ import (
 	"errors"
 	"io"
 	"log"
+	"net/http"
 	"runtime/debug"
 	"sync"
 	"sync/atomic" // atomic 패키지 임포트 추가
-	"net/http"
 	"time"
 
 	"github.com/DevNewbie1826/hon/pkg/adaptor"
@@ -25,22 +25,6 @@ import (
 // 핸들러가 본문을 소비하지 않을 경우, 악의적인 클라이언트가 매우 큰 본문을 보내
 // 서버 리소스를 고갈시키는 것을 방지하기 위함입니다.
 const MaxDrainSize = 64 * 1024 // 64KB
-
-// bufReaderPool recycles bufio.Reader objects.
-// bufReaderPool은 bufio.Reader 객체를 재활용합니다.
-var bufReaderPool = sync.Pool{
-	New: func() any {
-		return bufio.NewReader(nil)
-	},
-}
-
-// bufWriterPool recycles bufio.Writer objects.
-// bufWriterPool은 bufio.Writer 객체를 재활용합니다.
-var bufWriterPool = sync.Pool{
-	New: func() any {
-		return bufio.NewWriter(nil)
-	},
-}
 
 // connectionStatePool recycles ConnectionState objects to reduce GC pressure.
 // connectionStatePool은 가비지 컬렉션(GC) 부하를 줄이기 위해 ConnectionState 객체를 재활용합니다.
@@ -70,25 +54,14 @@ func NewConnectionState(readTimeout time.Duration, cancel context.CancelFunc) *C
 	return s
 }
 
-// Release returns the reader and writer to their respective pools, and returns the state object to its pool.
-// Release는 리더와 라이터를 해당 풀로 반환하고, 상태 객체 또한 자신의 풀로 반환합니다.
-func (s *ConnectionState) Release() {
-	if s.Reader != nil {
-		bufReaderPool.Put(s.Reader)
-		s.Reader = nil
-	}
-	if s.Writer != nil {
-		bufWriterPool.Put(s.Writer)
-		s.Writer = nil
-	}
-	// Note: CancelFunc is managed by the context, no explicit release needed here.
-	// 참고: CancelFunc는 컨텍스트에 의해 관리되므로, 여기서 명시적인 해제는 필요 없습니다.
+// Reset resets the state object. (Buffers are handled by Engine)
+func (s *ConnectionState) Reset() {
+	s.Reader = nil
+	s.Writer = nil
 	s.CancelFunc = nil
-	s.ReadHandler = nil       // Clear custom read handler. // 사용자 정의 읽기 핸들러를 지웁니다.
-	s.Processing.Store(false) // Reset processing flag. // 처리 플래그를 재설정합니다.
-	s.ReadTimeout = 0         // Reset timeout. // 타임아웃을 재설정합니다.
-
-	connectionStatePool.Put(s)
+	s.ReadHandler = nil
+	s.Processing.Store(false)
+	s.ReadTimeout = 0
 }
 
 // CtxKeyConnectionState is the context key for retrieving ConnectionState.
@@ -115,12 +88,23 @@ func WithMaxDrainSize(size int64) Option {
 	}
 }
 
+// WithBufferSize sets the size of the bufio buffers.
+func WithBufferSize(size int) Option {
+	return func(e *Engine) {
+		e.bufferSize = size
+	}
+}
+
 // Engine is the core structure for processing HTTP requests.
 // Engine은 HTTP 요청을 처리하는 핵심 구조체입니다.
 type Engine struct {
-	Handler        http.Handler  // The HTTP handler to process requests. // 요청을 처리할 HTTP 핸들러입니다.
-	requestTimeout time.Duration // Timeout for processing individual requests. // 개별 요청 처리 타임아웃입니다.
-	maxDrainSize   int64         // Max bytes to drain from body. // 본문에서 드레인할 최대 바이트 수입니다.
+	Handler        http.Handler  // The HTTP handler to process requests.
+	requestTimeout time.Duration // Timeout for processing individual requests.
+	maxDrainSize   int64         // Max bytes to drain from body.
+	bufferSize     int           // Size of the bufio buffers.
+
+	readerPool sync.Pool // Pool for bufio.Reader
+	writerPool sync.Pool // Pool for bufio.Writer
 }
 
 // NewEngine creates a new Engine.
@@ -129,11 +113,36 @@ func NewEngine(handler http.Handler, opts ...Option) *Engine {
 	e := &Engine{
 		Handler:      handler,
 		maxDrainSize: MaxDrainSize, // Default 64KB
+		bufferSize:   4096,         // Default 4KB
 	}
 	for _, opt := range opts {
 		opt(e)
 	}
+
+	e.readerPool = sync.Pool{
+		New: func() any {
+			return bufio.NewReaderSize(nil, e.bufferSize)
+		},
+	}
+	e.writerPool = sync.Pool{
+		New: func() any {
+			return bufio.NewWriterSize(nil, e.bufferSize)
+		},
+	}
+
 	return e
+}
+
+// ReleaseConnectionState returns buffers to the engine's pools and the state to the global pool.
+func (e *Engine) ReleaseConnectionState(s *ConnectionState) {
+	if s.Reader != nil {
+		e.readerPool.Put(s.Reader)
+	}
+	if s.Writer != nil {
+		e.writerPool.Put(s.Writer)
+	}
+	s.Reset()
+	connectionStatePool.Put(s)
 }
 
 // ServeConn is used as netpoll's OnRequest callback.
@@ -156,11 +165,11 @@ func (e *Engine) ServeConn(ctx context.Context, conn netpoll.Connection) error {
 	// Initialize buffers if they are not already set (reused from state)
 	// 버퍼가 아직 설정되지 않았다면 초기화합니다 (상태에서 재사용됨).
 	if state.Reader == nil {
-		state.Reader = bufReaderPool.Get().(*bufio.Reader)
+		state.Reader = e.readerPool.Get().(*bufio.Reader)
 		state.Reader.Reset(conn)
 	}
 	if state.Writer == nil {
-		state.Writer = bufWriterPool.Get().(*bufio.Writer)
+		state.Writer = e.writerPool.Get().(*bufio.Writer)
 		state.Writer.Reset(conn)
 	}
 
