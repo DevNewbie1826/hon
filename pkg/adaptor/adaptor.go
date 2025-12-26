@@ -28,7 +28,7 @@ type Hijacker interface {
 // currentDate holds the cached Date header value.
 // currentDate는 캐시된 Date 헤더 값을 저장합니다.
 var currentDate atomic.Value
-var crlf = []byte("\r\n") // CRLF (Carriage Return Line Feed) bytes. // CRLF (캐리지 리턴 라인 피드) 바이트입니다.
+var crlf = []byte("\r\n")          // CRLF (Carriage Return Line Feed) bytes. // CRLF (캐리지 리턴 라인 피드) 바이트입니다.
 var chunkEnd = []byte("0\r\n\r\n") // The terminating chunk for chunked transfer encoding. // 청크 전송 인코딩의 종료 청크입니다.
 var lastChunk = []byte("0\r\n")    // The last chunk indicator before trailers. // 트레일러 전의 마지막 청크 표시자입니다.
 
@@ -62,7 +62,7 @@ type ResponseWriter struct {
 var rwPool = sync.Pool{
 	New: func() any {
 		return &ResponseWriter{
-			header: make(http.Header),
+			header:  make(http.Header),
 			trailer: make(http.Header),
 		}
 	},
@@ -187,10 +187,7 @@ func (w *ResponseWriter) Write(p []byte) (int, error) {
 		// Content-Type이 설정되지 않았다면 응답 본문의 첫 512바이트를 기반으로 Content-Type을 감지합니다.
 		if w.header.Get("Content-Type") == "" { // Sniffing logic simplified as len(p) > 0 check is done above
 			// http.DetectContentType only needs the first 512 bytes
-			sniffLen := len(p)
-			if sniffLen > 512 {
-				sniffLen = 512
-			}
+			sniffLen := min(len(p), 512)
 			w.header.Set("Content-Type", http.DetectContentType(p[:sniffLen]))
 		}
 
@@ -308,13 +305,13 @@ func (w *ResponseWriter) WriteHeader(statusCode int) {
 }
 
 var (
-	headerDate          = []byte("Date: ")           // HTTP Date header key and colon. // HTTP Date 헤더 키와 콜론입니다.
-	headerContentLength = "Content-Length"             // HTTP Content-Length header key. // HTTP Content-Length 헤더 키입니다.
-	headerContentType   = "Content-Type"               // HTTP Content-Type header key. // HTTP Content-Type 헤더 키입니다.
-	headerTransferEnc   = "Transfer-Encoding"          // HTTP Transfer-Encoding header key. // HTTP Transfer-Encoding 헤더 키입니다.
-	headerConnection    = "Connection"                 // HTTP Connection header key. // HTTP Connection 헤더 키입니다.
-	
-	bytesTransferEncodingChunked = []byte("Transfer-Encoding: chunked\r\n")        // Pre-computed bytes for chunked transfer encoding header.
+	headerDate          = []byte("Date: ")    // HTTP Date header key and colon. // HTTP Date 헤더 키와 콜론입니다.
+	headerContentLength = "Content-Length"    // HTTP Content-Length header key. // HTTP Content-Length 헤더 키입니다.
+	headerContentType   = "Content-Type"      // HTTP Content-Type header key. // HTTP Content-Type 헤더 키입니다.
+	headerTransferEnc   = "Transfer-Encoding" // HTTP Transfer-Encoding header key. // HTTP Transfer-Encoding 헤더 키입니다.
+	headerConnection    = "Connection"        // HTTP Connection header key. // HTTP Connection 헤더 키입니다.
+
+	bytesTransferEncodingChunked         = []byte("Transfer-Encoding: chunked\r\n")           // Pre-computed bytes for chunked transfer encoding header.
 	bytesTransferEncodingChunkedTrailers = []byte("Transfer-Encoding: chunked, trailers\r\n") // Pre-computed bytes for chunked + trailers transfer encoding header.
 )
 
@@ -472,7 +469,6 @@ func (c *BufferedConn) Read(p []byte) (n int, err error) {
 	return c.Connection.Read(p)
 }
 
-
 // Hijacked returns whether the connection has been hijacked.
 // Hijacked는 연결이 하이재킹되었는지 여부를 반환합니다.
 func (w *ResponseWriter) Hijacked() bool {
@@ -599,7 +595,7 @@ func (w *ResponseWriter) CloseNotify() <-chan bool {
 		ch <- true
 		return ch
 	}
-	
+
 	// Use the request context's Done channel
 	// 요청 컨텍스트의 Done 채널을 사용합니다.
 	go func() {
@@ -627,10 +623,7 @@ func (w *ResponseWriter) WriteString(s string) (int, error) {
 		// Sniff Content-Type if not set
 		if w.header.Get("Content-Type") == "" && len(s) > 0 {
 			// http.DetectContentType only needs the first 512 bytes
-			sniffLen := len(s)
-			if sniffLen > 512 {
-				sniffLen = 512
-			}
+			sniffLen := min(len(s), 512)
 			w.header.Set("Content-Type", http.DetectContentType([]byte(s[:sniffLen])))
 		}
 		if err := w.ensureHeaderSent(); err != nil {
