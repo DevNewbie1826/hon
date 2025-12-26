@@ -1,0 +1,121 @@
+# Hon (혼)
+
+[🇰🇷 한국어 (Korean)](README_KO.md) | [🇺🇸 English](README.md)
+
+**Hon**은 [CloudWeGo Netpoll](https://github.com/cloudwego/netpoll) 기반의 고성능 HTTP 엔진 어댑터입니다. **Hon**은 "HTTP-over-Netpoll"의 약자입니다.
+
+Go 언어의 표준 `net/http` 인터페이스를 그대로 사용하면서, 이벤트 기반(epoll/kqueue)의 Reactor 패턴을 통한 고성능 I/O 처리를 가능하게 합니다. 이를 통해 Gin, Chi, Echo 등 기존의 인기 있는 Go 웹 프레임워크를 코드 변경 없이 Netpoll 위에서 실행하며, 대규모 동시 접속 환경을 효율적으로 관리할 수 있습니다.
+
+## 🚀 주요 특징 (Key Features)
+
+- **압도적인 동시성 처리**: Reactor 패턴을 통해 **25,000개 이상의 동시 접속자**가 있어도 단 **6개의 고루틴**만으로 서버를 안정적으로 운영합니다. (표준 서버 대비 고루틴 사용량 99.9% 절감)
+- **표준 호환성**: `http.Handler` 인터페이스를 완벽하게 지원하여 `chi`, `gin`, `echo`, `mux` 등 기존 라우터를 그대로 사용 가능합니다.
+- **리소스 효율성**: Thread-per-Connection 방식의 오버헤드를 제거하여 CPU 사용 효율을 극대화했습니다.
+- **메모리 관리**: Netpoll의 고성능 메모리 캐시(`mcache`)를 활용하여 대규모 트래픽 상황에서도 메모리 할당/해제 비용을 최소화하고 안정적인 성능을 유지합니다.
+- **이벤트 기반 WebSocket**: `SetReadHandler`를 통해 WebSocket 연결조차 고루틴 점유 없이 이벤트 루프에서 처리하는 독보적인 성능을 제공합니다.
+- **SSE 지원**: `http.Flusher` 구현을 통해 효율적인 Server-Sent Events 스트리밍을 지원합니다.
+
+## 📊 성능 벤치마크 (Benchmark)
+
+단일 머신(macOS)에서 **25,000개 동시 WebSocket 접속** 테스트 결과:
+
+| 지표 | 표준 서버 (`net/http`) | **Hon (`Netpoll`)** | 개선 효과 |
+| :--- | :--- | :--- | :--- |
+| **고루틴 개수** | 25,000+ (약 1.8만개에서 장애 발생) | **6 개** | **99.9% 절감** |
+| **안정성** | 2.5만 연결 유지 실패 | **2.5만 연결 안정적 유지** | **고가용성 확보** |
+| **아키텍처** | 연결당 고루틴 할당 | **이벤트 기반 Reactor** | **Non-blocking I/O** |
+
+> **메모리 참고**: Hon은 처리량(Throughput)과 지연 시간 안정성을 최우선으로 합니다. Netpoll의 메모리 캐시(`mcache`)를 적극 활용하여 할당 오버헤드를 줄이므로, 트래픽이 몰릴 때도 일관된 성능을 보장합니다. (테스트 기준 2.5만 연결 시 약 495MB 사용)
+
+## 📦 설치 (Installation)
+
+```bash
+go get github.com/DevNewbie1826/hon
+```
+
+## 💡 사용 예제 (Usage)
+
+### 기본 사용법 (최적화 옵션 포함)
+
+```go
+package main
+
+import (
+	"log"
+	"net/http"
+	"time"
+
+	"github.com/DevNewbie1826/hon/pkg/engine"
+	"github.com/DevNewbie1826/hon/pkg/server"
+)
+
+func main() {
+	mux := http.NewServeMux()
+	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
+		w.Write([]byte("Hello, Hon!"))
+	})
+
+	// 버퍼 크기 최적화 (Default: 4KB)
+	eng := engine.NewEngine(mux, 
+		engine.WithBufferSize(1024),
+		engine.WithRequestTimeout(5*time.Second),
+	)
+
+	srv := server.NewServer(eng,
+		server.WithReadTimeout(10*time.Second),
+		server.WithWriteTimeout(10*time.Second),
+	)
+
+	log.Println("Server listening on :1826")
+	if err := srv.Serve(":1826"); err != nil {
+		log.Fatal(err)
+	}
+}
+```
+
+### 이벤트 기반 WebSocket 처리 (Reactor Mode)
+
+고루틴을 생성하지 않고 WebSocket 메시지를 처리하는 가장 효율적인 방법입니다.
+권장 라이브러리: `github.com/gobwas/ws`
+
+```go
+func wsHandler(w http.ResponseWriter, r *http.Request) {
+    // Upgrade connection...
+    if hijacker, ok := w.(adaptor.Hijacker); ok {
+        hijacker.SetReadHandler(func(c net.Conn, rw *bufio.ReadWriter) error {
+            // 이 콜백은 Netpoll 워커 풀에서 실행됩니다.
+            // 절대 여기서 블로킹 루프(for loop)를 돌리면 안 됩니다.
+            
+            // gobwas/wsutil 사용 예제
+            msg, op, err := wsutil.ReadClientData(rw)
+            if err != nil {
+                return err
+            }
+            return wsutil.WriteServerMessage(rw, op, msg)
+        })
+    }
+}
+```
+
+## 🛠 성능 테스트 도구
+
+프로젝트 루트에 포함된 `ws_stress_config.go`를 사용하여 직접 성능을 검증할 수 있습니다.
+
+```bash
+# 1만개 연결을 30초간 유지하며 테스트
+go run ws_stress_config.go -c 10000 -hold 30s
+```
+
+## 🏗 아키텍처 (Architecture)
+
+- **Server**: Netpoll의 EventLoop를 관리하고 TCP 연결을 수신합니다.
+- **Engine**: Connection별 상태(`ConnectionState`) 및 버퍼 풀을 관리하며, 핸들러로 요청을 디스패치합니다.
+- **Adaptor**: Netpoll의 raw connection과 표준 `net/http` 객체 간의 변환을 담당합니다.
+
+## 🤝 기여 (Contributing)
+
+버그 리포트나 기능 제안은 언제나 환영합니다. 이슈를 등록하거나 PR을 보내주세요.
+
+## 📄 라이선스 (License)
+
+MIT License
