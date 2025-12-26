@@ -37,12 +37,12 @@ var connectionStatePool = sync.Pool{
 // ConnectionState holds the state of a connection, including buffers and custom handler.
 // ConnectionState는 연결의 상태를 나타내며, 버퍼 및 사용자 정의 핸들러를 포함합니다.
 type ConnectionState struct {
-	Reader      *bufio.Reader          // Reusable bufio.Reader for the connection. // 연결을 위한 재사용 가능한 bufio.Reader입니다.
-	Writer      *bufio.Writer          // Reusable bufio.Writer for the connection. // 연결을 위한 재사용 가능한 bufio.Writer입니다.
-	ReadHandler appcontext.ReadHandler // Custom read handler for protocols like WebSocket. // WebSocket과 같은 프로토콜을 위한 사용자 정의 읽기 핸들러입니다.
-	Processing  atomic.Bool            // Atomic flag to prevent concurrent processing of the same connection. // 동일한 연결의 동시 처리를 방지하기 위한 아토믹 플래그입니다.
-	ReadTimeout time.Duration          // The configured read timeout for the connection. // 연결에 설정된 읽기 타임아웃입니다.
-	CancelFunc  context.CancelFunc     // Function to cancel the request context. // 요청 컨텍스트를 취소하는 함수입니다.
+	Reader      *bufio.Reader          // Reusable bufio.Reader for the connection.
+	Writer      *bufio.Writer          // Reusable bufio.Writer for the connection.
+	ReadHandler appcontext.ReadHandler // Custom read handler for protocols like WebSocket.
+	CancelFunc  context.CancelFunc     // Function to cancel the request context.
+	ReadTimeout time.Duration          // The configured read timeout for the connection.
+	Processing  atomic.Bool            // Atomic flag to prevent concurrent processing of the same connection.
 }
 
 // NewConnectionState retrieves a ConnectionState from the pool and initializes it.

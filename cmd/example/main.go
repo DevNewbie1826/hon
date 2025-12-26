@@ -9,6 +9,7 @@ import (
 	"net"
 	"net/http"
 	_ "net/http/pprof" // Import for profiling
+	"syscall"
 	"time"
 
 	"github.com/DevNewbie1826/hon/pkg/adaptor"
@@ -21,9 +22,19 @@ import (
 	"github.com/gorilla/websocket"
 )
 
+func SetUlimit() error {
+	var rLimit syscall.Rlimit
+	if err := syscall.Getrlimit(syscall.RLIMIT_NOFILE, &rLimit); err != nil {
+		return err
+	}
+	rLimit.Cur = rLimit.Max
+	return syscall.Setrlimit(syscall.RLIMIT_NOFILE, &rLimit)
+}
+
 func main() {
 	// Set up logging to standard output
 	log.SetFlags(log.LstdFlags | log.Lshortfile)
+	SetUlimit()
 
 	// Start pprof server for profiling in a separate goroutine
 	go func() {
