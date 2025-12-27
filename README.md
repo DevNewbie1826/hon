@@ -17,10 +17,6 @@ It allows you to run existing popular Go web frameworks like Gin, Chi, and Echo 
 
 ## 📊 Performance Benchmark
 
-
-
-## 📊 Performance Benchmark
-
 ### 1. HTTP Throughput (High Performance)
 
 Tested with **`wrk`** (125 connections, 4 threads, 30s).
