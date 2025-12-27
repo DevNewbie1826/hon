@@ -5,6 +5,7 @@ import (
 	"log"
 	"net/url"
 	"sync"
+	"sync/atomic"
 	"syscall"
 	"time"
 
@@ -33,8 +34,21 @@ func main() {
 	log.Printf("Starting %d connections to %s...", *conns, u.String())
 
 	var wg sync.WaitGroup
-	// Limit dial concurrency to avoid overwhelming the OS/Network
-	dialSem := make(chan struct{}, 200)
+	var connected int64
+	// Extreme dial concurrency
+	dialSem := make(chan struct{}, 1000)
+
+	// Monitor reporter
+	go func() {
+		ticker := time.NewTicker(1 * time.Second)
+		defer ticker.Stop()
+		for range ticker.C {
+			current := atomic.LoadInt64(&connected)
+			if current > 0 {
+				log.Printf("Current active connections: %d", current)
+			}
+		}
+	}()
 
 	for i := 0; i < *conns; i++ {
 		wg.Add(1)
@@ -45,21 +59,16 @@ func main() {
 			<-dialSem
 
 			if err != nil {
-				if id < 5 {
-					log.Printf("Dial failed: %v", err)
-				}
 				return
 			}
-			defer c.Close()
+			atomic.AddInt64(&connected, 1)
+			defer func() {
+				c.Close()
+				atomic.AddInt64(&connected, -1)
+			}()
 
-			// Keep the connection alive
 			time.Sleep(*hold)
 		}(i)
-
-		// Slight delay to avoid massive burst of CPU usage during dial
-		if i%200 == 0 && i > 0 {
-			time.Sleep(10 * time.Millisecond)
-		}
 	}
 
 	wg.Wait()

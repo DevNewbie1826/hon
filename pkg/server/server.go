@@ -7,7 +7,7 @@ import (
 
 	"github.com/DevNewbie1826/hon/pkg/engine"
 	"github.com/cloudwego/netpoll"
-	"github.com/libp2p/go-reuseport"
+	"github.com/valyala/fasthttp/reuseport"
 )
 
 // Server is the top-level structure for the netpoll server.
@@ -136,5 +136,3 @@ func (s *Server) Shutdown(ctx context.Context) error {
 	}
 	return s.eventLoop.Shutdown(ctx)
 }
-
-

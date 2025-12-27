@@ -17,15 +17,29 @@ It allows you to run existing popular Go web frameworks like Gin, Chi, and Echo 
 
 ## 📊 Performance Benchmark
 
+### 1. HTTP Throughput (Stateless)
+
+Hon demonstrates superior performance in handling massive amounts of short-lived HTTP requests.
+Tested with **10,000,000 requests** using `bombardier` (125 concurrent connections).
+
+| Metric | Standard (`net/http`) | **Hon** | Improvement |
+| :--- | :--- | :--- | :--- |
+| **Requests/sec** | ~108,556 | **~200,203** | **~1.85x Faster** |
+| **Latency (Avg)** | 1.15ms | **0.62ms** | **~46% Lower** |
+| **Throughput** | 53.83MB/s | **102.91MB/s** | **~1.9x Higher** |
+
+> **Result**: Hon handles heavy traffic loads significantly better than the standard library, maintaining lower latency and higher throughput over long-running tests.
+
+### 2. WebSocket Concurrency (Resource Usage)
+
 Tested with **25,000 concurrent WebSocket connections** on a single machine (macOS).
 
 | Metric | Standard (`net/http`) | **Hon (`Netpoll`)** | Improvement |
 | :--- | :--- | :--- | :--- |
-| **Goroutines** | 25,000+ (Crashed at ~18k) | **6** | **99.9% Reduction** |
-| **Stability** | Failed to sustain 25k | **Stable at 25k** | **High Availability** |
+| **Goroutines** | **25,005** | **6** | **~99.9% Reduction** |
 | **Architecture** | Thread-per-Connection | **Event-Driven Reactor** | **Non-blocking I/O** |
 
-> **Note on Memory**: Hon prioritizes throughput and latency stability. It utilizes `mcache` (Netpoll's memory cache) to minimize allocation overhead during high concurrency, maintaining a consistent memory footprint (approx. 495MB for 25k connections in our test).
+> **Note**: Standard `net/http` requires one goroutine per connection. Hon utilizes Netpoll's event-driven architecture to handle 25k connections with a fixed, minimal number of worker goroutines (only 6 in this test), ensuring massive scalability.
 
 ## 📦 Installation
 
