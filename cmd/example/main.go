@@ -15,6 +15,7 @@ import (
 	"github.com/DevNewbie1826/hon/pkg/adaptor"
 	hengine "github.com/DevNewbie1826/hon/pkg/engine"
 	hserver "github.com/DevNewbie1826/hon/pkg/server"
+	"github.com/valyala/fasthttp/reuseport"
 
 	"github.com/cloudwego/netpoll"
 	"github.com/gobwas/ws"
@@ -76,12 +77,16 @@ func main() {
 }
 
 func std(mux http.Handler, addr string) {
+	l, err := reuseport.Listen("tcp", addr)
+	if err != nil {
+		log.Fatalf("Failed to listen on %s: %v", addr, err)
+	}
+
 	srv := &http.Server{
-		Addr:    addr,
 		Handler: mux,
 	}
 	log.Printf("Standard net/http server starting on %s...", addr)
-	if err := srv.ListenAndServe(); err != nil {
+	if err := srv.Serve(l); err != nil {
 		log.Fatalf("Standard server failed: %v", err)
 	}
 }

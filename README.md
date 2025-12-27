@@ -17,29 +17,35 @@ It allows you to run existing popular Go web frameworks like Gin, Chi, and Echo 
 
 ## 📊 Performance Benchmark
 
-### 1. HTTP Throughput (Stateless)
 
-Hon demonstrates superior performance in handling massive amounts of short-lived HTTP requests.
-Tested with **10,000,000 requests** using `bombardier` (125 concurrent connections).
+
+## 📊 Performance Benchmark
+
+### 1. HTTP Throughput (High Performance)
+
+Tested with **`wrk`** (125 connections, 4 threads, 30s).
+Hon outperforms the standard library, demonstrating superior efficiency.
 
 | Metric | Standard (`net/http`) | **Hon** | Improvement |
 | :--- | :--- | :--- | :--- |
-| **Requests/sec** | ~108,556 | **~200,203** | **~1.85x Faster** |
-| **Latency (Avg)** | 1.15ms | **0.62ms** | **~46% Lower** |
-| **Throughput** | 53.83MB/s | **102.91MB/s** | **~1.9x Higher** |
+| **Requests/sec** | 197,387 | **214,640** | **~8.7% Faster** |
+| **Throughput** | 86.22MB/s | **97.64MB/s** | **Higher Bandwidth** |
+| **Socket Errors** | 86 (connect) | **0** | **More Stable** |
 
-> **Result**: Hon handles heavy traffic loads significantly better than the standard library, maintaining lower latency and higher throughput over long-running tests.
+> **Result**: Hon achieves higher throughput and zero connection errors under heavy load, proving it's not just a compatibility layer but a performance upgrade.
 
-### 2. WebSocket Concurrency (Resource Usage)
+### 2. WebSocket Concurrency (Resource Efficiency)
 
-Tested with **25,000 concurrent WebSocket connections** on a single machine (macOS).
+Tested with **15,000 concurrent WebSocket connections** on a single machine (macOS).
+Both servers used `SO_REUSEPORT` for a fair comparison.
 
 | Metric | Standard (`net/http`) | **Hon (`Netpoll`)** | Improvement |
 | :--- | :--- | :--- | :--- |
-| **Goroutines** | **25,005** | **6** | **~99.9% Reduction** |
+| **Connections** | 15,000 (Stable) | **15,000 (Stable)** | **Equal Stability** |
+| **Goroutines** | **15,005** | **6** | **~99.9% Reduction** |
 | **Architecture** | Thread-per-Connection | **Event-Driven Reactor** | **Non-blocking I/O** |
 
-> **Note**: Standard `net/http` requires one goroutine per connection. Hon utilizes Netpoll's event-driven architecture to handle 25k connections with a fixed, minimal number of worker goroutines (only 6 in this test), ensuring massive scalability.
+> **Key Takeaway**: Both servers successfully maintained 15,000 active connections. However, the standard server required **15,005 goroutines** (consuming significant stack memory), while **Hon** handled the exact same load with just **6 goroutines**. This efficiency is critical for scaling to hundreds of thousands of connections.
 
 ## 📦 Installation
 
