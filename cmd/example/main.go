@@ -46,7 +46,7 @@ func main() {
 		}
 	}()
 
-	serverType := flag.String("type", "hon", "Server type: hon, std")
+	serverType := flag.String("type", "hon", "Server type: hon, std, reuseport")
 	flag.Parse()
 
 	mux := http.NewServeMux()
@@ -68,15 +68,26 @@ func main() {
 
 	addr := ":1826"
 
-	if *serverType == "std" {
+	switch *serverType {
+	case "std":
 		std(mux, addr)
-		return
+	case "reuseport":
+		stdReuseport(mux, addr)
+	case "hon":
+		hon(mux, addr)
+	default:
+		log.Fatalf("Unknown server type: %s. Available: hon, std, reuseport", *serverType)
 	}
-
-	hon(mux, addr)
 }
 
 func std(mux http.Handler, addr string) {
+	log.Printf("Standard net/http server starting on %s...", addr)
+	if err := http.ListenAndServe(addr, mux); err != nil {
+		log.Fatalf("Standard server failed: %v", err)
+	}
+}
+
+func stdReuseport(mux http.Handler, addr string) {
 	l, err := reuseport.Listen("tcp", addr)
 	if err != nil {
 		log.Fatalf("Failed to listen on %s: %v", addr, err)
@@ -85,7 +96,7 @@ func std(mux http.Handler, addr string) {
 	srv := &http.Server{
 		Handler: mux,
 	}
-	log.Printf("Standard net/http server starting on %s...", addr)
+	log.Printf("Standard net/http server (reuseport) starting on %s...", addr)
 	if err := srv.Serve(l); err != nil {
 		log.Fatalf("Standard server failed: %v", err)
 	}

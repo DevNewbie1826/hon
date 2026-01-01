@@ -19,29 +19,32 @@ It allows you to run existing popular Go web frameworks like Gin, Chi, and Echo 
 
 ### 1. HTTP Throughput (High Performance)
 
-Tested with **`wrk`** (125 connections, 4 threads, 30s).
-Hon outperforms the standard library, demonstrating superior efficiency.
+Tested with **`wrk`** (100 connections, 2 threads, 10s) on a local environment.
+We compared three modes: **Standard** (`net/http`), **Standard + Reuseport**, and **Hon**.
 
-| Metric | Standard (`net/http`) | **Hon** | Improvement |
-| :--- | :--- | :--- | :--- |
-| **Requests/sec** | 197,387 | **214,640** | **~8.7% Faster** |
-| **Throughput** | 86.22MB/s | **97.64MB/s** | **Higher Bandwidth** |
-| **Socket Errors** | 86 (connect) | **0** | **More Stable** |
+| Metric | Standard (`net/http`) | Std (`reuseport`) | **Hon** | vs Std | vs Reuse |
+| :--- | :--- | :--- | :--- | :--- | :--- |
+| **Requests/sec** | 129,695 | 211,771 | **232,814** | **+79%** | **+10%** |
+| **Throughput** | 56.65MB/s | 92.50MB/s | **105.91MB/s** | **+87%** | **+14%** |
 
-> **Result**: Hon achieves higher throughput and zero connection errors under heavy load, proving it's not just a compatibility layer but a performance upgrade.
+> **Analysis**: 
+> - **Standard (`net/http`)**: The baseline performance.
+> - **Reuseport**: Significantly improves throughput (+63%) by reducing lock contention on the listener, allowing multiple threads to accept connections.
+> - **Hon**: Further improves performance (+10% over Reuseport, +79% over Standard) by utilizing the **Reactor pattern** (Netpoll) and efficient memory pooling, minimizing Garbage Collection and Goroutine scheduling overhead.
 
 ### 2. WebSocket Concurrency (Resource Efficiency)
 
 Tested with **15,000 concurrent WebSocket connections** on a single machine (macOS).
-Both servers used `SO_REUSEPORT` for a fair comparison.
 
-| Metric | Standard (`net/http`) | **Hon (`Netpoll`)** | Improvement |
+| Metric | Standard (`net/http`) | Std (`reuseport`) | **Hon (`Netpoll`)** |
 | :--- | :--- | :--- | :--- |
-| **Connections** | 15,000 (Stable) | **15,000 (Stable)** | **Equal Stability** |
-| **Goroutines** | **15,005** | **6** | **~99.9% Reduction** |
-| **Architecture** | Thread-per-Connection | **Event-Driven Reactor** | **Non-blocking I/O** |
+| **Connections** | 15,000 (Stable) | 15,000 (Stable) | **15,000 (Stable)** |
+| **Goroutines** | 15,005 | 15,005 | **6** |
+| **Architecture** | Thread-per-Conn | Thread-per-Conn | **Event-Driven Reactor** |
 
-> **Key Takeaway**: Both servers successfully maintained 15,000 active connections. However, the standard server required **15,005 goroutines** (consuming significant stack memory), while **Hon** handled the exact same load with just **6 goroutines**. This efficiency is critical for scaling to hundreds of thousands of connections.
+> **Key Takeaway**: 
+> - **Standard & Reuseport**: Both utilize a **Thread-per-Connection** model, spawning **15,005 goroutines** to handle 15,000 connections. This consumes significant memory (stack space) and increases scheduling overhead.
+> - **Hon**: Handles the exact same load with just **6 goroutines** by leveraging the **Reactor pattern**. This represents a **~99.9% reduction** in resource usage, making it ideal for massive concurrency (C10M+).
 
 ## 📦 Installation
 
@@ -51,42 +54,19 @@ go get github.com/DevNewbie1826/hon
 
 ## 💡 Usage
 
-### Basic Usage with Optimization
+### Basic Usage
 
-```go
-package main
+You can run the example server to test different modes:
 
-import (
-	"log"
-	"net/http"
-	"time"
+```bash
+# Run in Hon mode (Default)
+go run cmd/example/main.go -type hon
 
-	"github.com/DevNewbie1826/hon/pkg/engine"
-	"github.com/DevNewbie1826/hon/pkg/server"
-)
+# Run in Standard mode (net/http)
+go run cmd/example/main.go -type std
 
-func main() {
-	mux := http.NewServeMux()
-	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
-		w.Write([]byte("Hello, Hon!"))
-	})
-
-	// Optimize buffer size for high concurrency (Default: 4KB)
-	eng := engine.NewEngine(mux, 
-		engine.WithBufferSize(1024),
-		engine.WithRequestTimeout(5*time.Second),
-	)
-
-	srv := server.NewServer(eng,
-		server.WithReadTimeout(10*time.Second),
-		server.WithWriteTimeout(10*time.Second),
-	)
-
-	log.Println("Server listening on :1826")
-	if err := srv.Serve(":1826"); err != nil {
-		log.Fatal(err)
-	}
-}
+# Run in Reuseport mode (net/http + reuseport)
+go run cmd/example/main.go -type reuseport
 ```
 
 ### Event-Driven WebSocket (Zero-Goroutine)
