@@ -2,116 +2,76 @@
 
 [🇰🇷 한국어 (Korean)](README_KO.md) | [🇺🇸 English](README.md)
 
-**Hon** is a high-performance HTTP engine adapter based on [CloudWeGo Netpoll](https://github.com/cloudwego/netpoll). **Hon** stands for "HTTP-over-Netpoll".
-
-It allows you to run existing popular Go web frameworks like Gin, Chi, and Echo on top of Netpoll without code changes, enabling high-performance I/O processing based on the Reactor pattern (epoll/kqueue) while maintaining the standard `net/http` interface.
+**Hon** (HTTP-over-Netpoll) is a high-performance HTTP engine adapter based on [CloudWeGo Netpoll](https://github.com/cloudwego/netpoll). It enables standard Go web frameworks (Gin, Chi, Echo) to handle massive concurrency using the **Reactor pattern** with zero code changes.
 
 ## 🚀 Key Features
 
-- **Extreme Concurrency**: Handle **25,000+ concurrent connections** with only **6 goroutines**. (99.9% reduction compared to standard `net/http`)
-- **Standard Compatibility**: Fully supports `http.Handler` interface, compatible with `chi`, `gin`, `echo`, `mux`, etc.
-- **Resource Efficiency**: Maximizes CPU utilization by eliminating the thread-per-connection overhead.
-- **Memory Management**: Utilizes Netpoll's `mcache` for high-performance memory allocation and reuse, ensuring stable operation under heavy load.
-- **Reactor Mode WebSocket**: Process WebSocket messages directly in the event loop without spawning goroutines per connection.
-- **SSE Support**: Supports Server-Sent Events streaming via `http.Flusher`.
+- **Extreme Concurrency**: Handle **25,000+ connections** with only **6 goroutines**.
+- **Resource Efficiency**: Maximizes CPU utilization by eliminating the Thread-per-Connection overhead.
+- **Standard Compatibility**: Fully supports the `http.Handler` interface, allowing you to use existing routers like `chi`, `gin`, `echo`, `mux`, etc., without any code changes.
+- **Memory Management**: Utilizes Netpoll's high-performance memory cache (`mcache`) to minimize allocation/deallocation costs and ensure stable performance under heavy traffic.
+- **Zero-Allocation**: Custom WebSocket parser achieving **0 allocs/op**.
+- **Streaming**: Optimized for large data with **64KB chunked processing**.
 
-## 📊 Performance Benchmark
+## 📊 Performance Benchmark (Hon vs Standard)
 
-### 1. HTTP Throughput (High Performance)
+Tested on macOS M4 (Local).
 
-Tested with **`wrk`** (100 connections, 2 threads, 10s) on a local environment.
-We compared three modes: **Standard** (`net/http`), **Standard + Reuseport**, and **Hon**.
-
-| Metric | Standard (`net/http`) | Std (`reuseport`) | **Hon** | vs Std | vs Reuse |
-| :--- | :--- | :--- | :--- | :--- | :--- |
-| **Requests/sec** | 129,695 | 211,771 | **232,814** | **+79%** | **+10%** |
-| **Throughput** | 56.65MB/s | 92.50MB/s | **105.91MB/s** | **+87%** | **+14%** |
+### 1. HTTP Throughput (RPS)
+| Mode | Requests/sec | Improvement |
+| :--- | :--- | :--- |
+| Standard (`net/http`) | 129,616 | - |
+| **Hon** | **233,404** | **+80%** |
 
 > **Analysis**: 
-> - **Standard (`net/http`)**: The baseline performance.
-> - **Reuseport**: Significantly improves throughput (+63%) by reducing lock contention on the listener, allowing multiple threads to accept connections.
-> - **Hon**: Further improves performance (+10% over Reuseport, +79% over Standard) by utilizing the **Reactor pattern** (Netpoll) and efficient memory pooling, minimizing Garbage Collection and Goroutine scheduling overhead.
+> - **Hon**: Outperforms the standard Go server by **80%** by utilizing the **Reactor pattern** and efficient memory pooling.
 
-### 2. WebSocket Concurrency (Resource Efficiency)
-
-Tested with **15,000 concurrent WebSocket connections** on a single machine (macOS).
-
-| Metric | Standard (`net/http`) | Std (`reuseport`) | **Hon (`Netpoll`)** |
-| :--- | :--- | :--- | :--- |
-| **Connections** | 15,000 (Stable) | 15,000 (Stable) | **15,000 (Stable)** |
-| **Goroutines** | 15,005 | 15,005 | **6** |
-| **Architecture** | Thread-per-Conn | Thread-per-Conn | **Event-Driven Reactor** |
+### 2. WebSocket Efficiency (15,000 Conns)
+| Mode | Goroutines | Resource Usage |
+| :--- | :--- | :--- |
+| Standard (`gorilla`) | 15,005 | 100% (1 per conn) |
+| **Hon** | **6** | **0.04% (Reactor)** |
 
 > **Key Takeaway**: 
-> - **Standard & Reuseport**: Both utilize a **Thread-per-Connection** model, spawning **15,005 goroutines** to handle 15,000 connections. This consumes significant memory (stack space) and increases scheduling overhead.
-> - **Hon**: Handles the exact same load with just **6 goroutines** by leveraging the **Reactor pattern**. This represents a **~99.9% reduction** in resource usage, making it ideal for massive concurrency (C10M+).
+> - **Standard**: Spawns **1 goroutine per connection**, creating 15,005 goroutines. This leads to massive scheduling overhead and GC pressure.
+> - **Hon**: Handles 15,000 connections with just **6 goroutines**. While initial memory usage (RSS) is slightly higher due to Netpoll's aggressive `mcache` and `LinkBuffer` pooling, it eliminates runtime GC overhead and scales linearly to C10M.
 
-## 📦 Installation
+## 📦 Quick Start
 
 ```bash
+# 1. Install
 go get github.com/DevNewbie1826/hon
-```
 
-## 💡 Usage
-
-### Basic Usage
-
-You can run the example server to test different modes:
-
-```bash
-# Run in Hon mode (Default)
+# 2. Run Example
 go run cmd/example/main.go -type hon
-
-# Run in Standard mode (net/http)
-go run cmd/example/main.go -type std
-
-# Run in Reuseport mode (net/http + reuseport)
-go run cmd/example/main.go -type reuseport
 ```
 
-### Event-Driven WebSocket (Zero-Goroutine)
-
-The most efficient way to handle WebSockets without spawning a goroutine per connection.
-Recommended library: `github.com/gobwas/ws`
+## 💡 Usage Example
 
 ```go
-func wsHandler(w http.ResponseWriter, r *http.Request) {
-    // Upgrade connection...
-    if hijacker, ok := w.(adaptor.Hijacker); ok {
-        hijacker.SetReadHandler(func(c net.Conn, rw *bufio.ReadWriter) error {
-            // This callback runs in the Netpoll worker pool.
-            // Do NOT use blocking loops here.
-            
-            // Example using gobwas/wsutil
-            msg, op, err := wsutil.ReadClientData(rw)
-            if err != nil {
-                return err
-            }
-            return wsutil.WriteServerMessage(rw, op, msg)
-        })
-    }
+func main() {
+    mux := http.NewServeMux()
+    
+    // 1. Standard HTTP Handler (Compatible with Gin, Chi, Echo)
+    mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
+        w.Write([]byte("Hello, Hon!"))
+    })
+
+    // 2. Hon Optimized WebSocket
+    mux.HandleFunc("/ws", func(w http.ResponseWriter, r *http.Request) {
+        adaptor.Upgrade(w, r, &MyWSHandler{})
+    })
+
+    eng := engine.NewEngine(mux)
+    server.NewServer(eng).Serve(":1826")
+}
+
+type MyWSHandler struct { websocket.DefaultHandler }
+func (h *MyWSHandler) OnMessage(c net.Conn, op ws.OpCode, payload []byte, fin bool) {
+    // Event-driven callback without per-connection goroutine
+    wsutil.WriteServerMessage(c, op, payload)
 }
 ```
 
-## 🛠 Stress Test
-
-You can verify the performance using the included stress test tool.
-
-```bash
-# Test with 10,000 connections held for 30 seconds
-go run ws_stress_config.go -c 10000 -hold 30s
-```
-
-## 🏗 Architecture
-
-- **Server**: Manages Netpoll's EventLoop and accepts TCP connections.
-- **Engine**: Manages connection state (`ConnectionState`) and buffer pools, dispatching requests to the handler.
-- **Adaptor**: Bridges Netpoll's raw connection and standard `net/http` objects.
-
-## 🤝 Contributing
-
-Bug reports and feature suggestions are welcome. Please submit an issue or PR.
-
 ## 📄 License
-
 MIT License
