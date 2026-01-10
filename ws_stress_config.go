@@ -28,10 +28,11 @@ func main() {
 	path := flag.String("path", "/ws-gobwas-low", "WebSocket endpoint path")
 	host := flag.String("host", "localhost:1826", "Server host and port")
 	hold := flag.Duration("hold", 20*time.Second, "Time to hold each connection")
+	echo := flag.Bool("echo", false, "Enable echo (send/receive) mode")
 	flag.Parse()
 
 	u := url.URL{Scheme: "ws", Host: *host, Path: *path}
-	log.Printf("Starting %d connections to %s...", *conns, u.String())
+	log.Printf("Starting %d connections to %s (Echo: %v)...", *conns, u.String(), *echo)
 
 	var wg sync.WaitGroup
 	var connected int64
@@ -67,7 +68,25 @@ func main() {
 				atomic.AddInt64(&connected, -1)
 			}()
 
-			time.Sleep(*hold)
+			if *echo {
+				deadline := time.Now().Add(*hold)
+				for time.Now().Before(deadline) {
+					msg := []byte("hello hon")
+					if err := c.WriteMessage(websocket.TextMessage, msg); err != nil {
+						return
+					}
+					_, resp, err := c.ReadMessage()
+					if err != nil {
+						return
+					}
+					if string(resp) != string(msg) {
+						log.Printf("Mismatch: sent %s, got %s", msg, resp)
+					}
+					time.Sleep(1 * time.Second)
+				}
+			} else {
+				time.Sleep(*hold)
+			}
 		}(i)
 	}
 

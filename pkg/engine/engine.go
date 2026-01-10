@@ -14,6 +14,7 @@ import (
 
 	"github.com/DevNewbie1826/hon/pkg/adaptor"
 	"github.com/DevNewbie1826/hon/pkg/appcontext"
+	"github.com/DevNewbie1826/hon/pkg/engine/parser"
 	"github.com/cloudwego/netpoll"
 )
 
@@ -215,6 +216,32 @@ func (e *Engine) serveHTTP(ctx context.Context, conn netpoll.Connection, state *
 		if !conn.IsActive() {
 			state.Processing.Store(false)
 			return
+		}
+
+		// Optimization: Lightweight Parser Check
+		// If bufio buffer is empty, we check the underlying netpoll buffer to see if we have a full request.
+		// If not, we yield the goroutine to avoid blocking inside http.ReadRequest.
+		if state.Reader.Buffered() == 0 {
+			r := conn.Reader()
+			if r != nil {
+				if r.Len() == 0 {
+					// No data in netpoll buffer.
+					// We yield.
+					state.Processing.Store(false)
+					return
+				}
+
+				// Peek all available data in Netpoll buffer without advancing
+				peekBuf, _ := r.Peek(r.Len())
+				res := parser.CheckRequest(peekBuf)
+
+				if !res.Complete {
+					// Request is incomplete. Return to yield the worker.
+					// Netpoll will call ServeConn again when more data arrives.
+					state.Processing.Store(false)
+					return
+				}
+			}
 		}
 
 		requestContext := appcontext.NewRequestContext(conn, ctx, state.Reader, state.Writer)
