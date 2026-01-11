@@ -76,6 +76,8 @@ type MockHandler struct {
 	OpenCnt    int32
 	MessageCnt int32
 	CloseCnt   int32
+	PingCnt    int32
+	PongCnt    int32
 	LastErr    error
 }
 
@@ -90,6 +92,14 @@ func (h *MockHandler) OnMessage(c net.Conn, op ws.OpCode, p []byte, fin bool) {
 func (h *MockHandler) OnClose(c net.Conn, err error) {
 	atomic.AddInt32(&h.CloseCnt, 1)
 	h.LastErr = err
+}
+
+func (h *MockHandler) OnPing(c net.Conn, payload []byte) {
+	atomic.AddInt32(&h.PingCnt, 1)
+}
+
+func (h *MockHandler) OnPong(c net.Conn, payload []byte) {
+	atomic.AddInt32(&h.PongCnt, 1)
 }
 
 // --- Tests ---
@@ -210,6 +220,122 @@ func TestStreamingLargePayload(t *testing.T) {
 	expectedChunks := int32(2)
 	if atomic.LoadInt32(&handler.MessageCnt) != expectedChunks {
 		t.Errorf("OnMessage called %d times, expected %d", handler.MessageCnt, expectedChunks)
+	}
+}
+
+// TestMultiplexing_PingPongData verifies interleaving control frames.
+func TestMultiplexing_PingPongData(t *testing.T) {
+	mc := NewMockConn()
+	
+	// 1. Text Frame "Hello"
+	ws.WriteFrame(mc.buf, ws.NewTextFrame([]byte("Hello")))
+	
+	// 2. Ping Frame
+	ws.WriteFrame(mc.buf, ws.NewPingFrame([]byte("ping")))
+	
+	// 3. Close Frame
+	ws.WriteFrame(mc.buf, ws.NewCloseFrame(ws.NewCloseFrameBody(ws.StatusNormalClosure, "")))
+
+	rw := bufio.NewReadWriter(bufio.NewReader(mc), bufio.NewWriter(mc))
+	mh := &MockHijacker{ResponseWriter: httptest.NewRecorder(), Conn: mc, RW: rw}
+	handler := &MockHandler{}
+
+	req := httptest.NewRequest("GET", "/ws", nil)
+	req.Header.Set("Connection", "Upgrade")
+	req.Header.Set("Upgrade", "websocket")
+	req.Header.Set("Sec-WebSocket-Key", "key")
+	
+	Upgrade(mh, req, handler)
+
+	mh.ReadHandler(mc, rw)
+
+	if atomic.LoadInt32(&handler.MessageCnt) != 1 {
+		t.Errorf("Expected 1 message, got %d", handler.MessageCnt)
+	}
+	if atomic.LoadInt32(&handler.PingCnt) != 1 {
+		t.Errorf("Expected 1 ping, got %d", handler.PingCnt)
+	}
+	if atomic.LoadInt32(&handler.CloseCnt) != 1 {
+		t.Errorf("Expected 1 close, got %d", handler.CloseCnt)
+	}
+}
+
+// TestFragmentedMessages verifies handling of fragmented frames (Fin=0, then Fin=1).
+func TestFragmentedMessages(t *testing.T) {
+	mc := NewMockConn()
+
+	// Frame 1: Fin=0, Op=Text, Payload="Hello "
+	h1 := ws.Header{
+		Fin:    false,
+		OpCode: ws.OpText,
+		Length: 6,
+	}
+	ws.WriteHeader(mc.buf, h1)
+	mc.buf.Write([]byte("Hello "))
+
+	// Frame 2: Fin=1, Op=Continuation, Payload="World"
+	h2 := ws.Header{
+		Fin:    true,
+		OpCode: ws.OpContinuation,
+		Length: 5,
+	}
+	ws.WriteHeader(mc.buf, h2)
+	mc.buf.Write([]byte("World"))
+
+	// Frame 3: Close
+	ws.WriteFrame(mc.buf, ws.NewCloseFrame(ws.NewCloseFrameBody(ws.StatusNormalClosure, "")))
+
+	rw := bufio.NewReadWriter(bufio.NewReader(mc), bufio.NewWriter(mc))
+	mh := &MockHijacker{ResponseWriter: httptest.NewRecorder(), Conn: mc, RW: rw}
+	handler := &MockHandler{}
+
+	req := httptest.NewRequest("GET", "/ws", nil)
+	req.Header.Set("Connection", "Upgrade")
+	req.Header.Set("Upgrade", "websocket")
+	req.Header.Set("Sec-WebSocket-Key", "key")
+	
+	Upgrade(mh, req, handler)
+	mh.ReadHandler(mc, rw)
+
+	// Since our handler is streaming-based, it should just deliver chunks as they come.
+	// It doesn't reassemble frames automatically (that's the user's job or higher-level library).
+	// We expect 2 callbacks to OnMessage.
+	if atomic.LoadInt32(&handler.MessageCnt) != 2 {
+		t.Errorf("Expected 2 message chunks, got %d", handler.MessageCnt)
+	}
+}
+
+// TestHandleError_ProtocolViolation checks error handling for large control frames.
+func TestHandleError_ControlFrameTooLarge(t *testing.T) {
+	mc := NewMockConn()
+	
+	// Create a Ping frame larger than 125 bytes (Protocol violation)
+	payload := make([]byte, 126)
+	// Manually write header because ws.NewPingFrame panics or limits size
+	// Fin=1, Op=Ping(9), Len=126 (requires 16-bit length)
+	mc.buf.WriteByte(0x89)
+	mc.buf.WriteByte(126) // 126 means next 2 bytes are length
+	mc.buf.WriteByte(0)
+	mc.buf.WriteByte(126)
+	mc.buf.Write(payload)
+
+	rw := bufio.NewReadWriter(bufio.NewReader(mc), bufio.NewWriter(mc))
+	mh := &MockHijacker{ResponseWriter: httptest.NewRecorder(), Conn: mc, RW: rw}
+	handler := &MockHandler{}
+
+	req := httptest.NewRequest("GET", "/ws", nil)
+	req.Header.Set("Connection", "Upgrade")
+	req.Header.Set("Upgrade", "websocket")
+	req.Header.Set("Sec-WebSocket-Key", "key")
+	
+	Upgrade(mh, req, handler)
+	mh.ReadHandler(mc, rw)
+
+	if atomic.LoadInt32(&handler.CloseCnt) != 1 {
+		t.Errorf("Expected connection close on protocol violation")
+	}
+	if handler.LastErr == nil {
+		t.Errorf("Expected error message, got nil")
 	}
 }
 

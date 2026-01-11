@@ -85,8 +85,8 @@ func (s *Server) Serve(addr string) error {
 	opts := []netpoll.Option{
 		netpoll.WithIdleTimeout(s.keepAliveTimeout),
 		netpoll.WithOnPrepare(func(conn netpoll.Connection) context.Context {
-			if err := conn.SetReadTimeout(s.readTimeout); err != nil { // nolint:errcheck
-				log.Printf("Failed to set read timeout: %v", err)
+			if err := conn.SetReadTimeout(s.readTimeout); err != nil {
+				log.Printf("Warning: Failed to set read timeout on new connection: %v", err)
 			}
 			if s.writeTimeout > 0 {
 				conn.SetWriteTimeout(s.writeTimeout)
@@ -105,15 +105,22 @@ func (s *Server) Serve(addr string) error {
 		netpoll.WithOnDisconnect(func(ctx context.Context, connection netpoll.Connection) {
 			// Retrieve and release ConnectionState resources
 			// ConnectionState 리소스를 검색하고 해제합니다.
-			if val := ctx.Value(engine.CtxKeyConnectionState); val != nil {
-				if state, ok := val.(*engine.ConnectionState); ok {
-					if state.CancelFunc != nil {
-						state.CancelFunc() // Cancels context on connection disconnect. // 연결이 끊어지면 컨텍스트를 취소합니다.
-					}
-					// Return buffers to the Engine's pool and state to global pool
-					s.Engine.ReleaseConnectionState(state)
-				}
+			val := ctx.Value(engine.CtxKeyConnectionState)
+			if val == nil {
+				log.Printf("Warning: ConnectionState not found in context during disconnect")
+				return
 			}
+			state, ok := val.(*engine.ConnectionState)
+			if !ok {
+				log.Printf("Warning: Invalid ConnectionState type in context during disconnect")
+				return
+			}
+
+			if state.CancelFunc != nil {
+				state.CancelFunc() // Cancels context on connection disconnect. // 연결이 끊어지면 컨텍스트를 취소합니다.
+			}
+			// Return buffers to the Engine's pool and state to global pool
+			s.Engine.ReleaseConnectionState(state)
 		}),
 	}
 

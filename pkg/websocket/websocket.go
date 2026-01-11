@@ -100,7 +100,7 @@ func readHeaderZeroAlloc(br *bufio.Reader) (h ws.Header, err error) {
 			return h, err
 		}
 		copy(h.Mask[:], b[headerBytes:total])
-	headerBytes = total
+		headerBytes = total
 	}
 
 	// 4. Consume bytes from buffer
@@ -145,11 +145,10 @@ func Upgrade(w http.ResponseWriter, r *http.Request, handler Handler, opts ...Op
 
 	// 3. Fast Handshake Response
 	acceptKey := computeAcceptKey(challengeKey)
-	rw.WriteString("HTTP/1.1 101 Switching Protocols\r\n")
-	rw.WriteString("Upgrade: websocket\r\n")
-	rw.WriteString("Connection: Upgrade\r\n")
-	rw.WriteString("Sec-WebSocket-Accept: " + acceptKey + "\r\n")
-	rw.WriteString("\r\n")
+	rw.WriteString("HTTP/1.1 101 Switching Protocols\r\n" +
+		"Upgrade: websocket\r\n" +
+		"Connection: Upgrade\r\n" +
+		"Sec-WebSocket-Accept: " + acceptKey + "\r\n\r\n")
 
 	if err := rw.Flush(); err != nil {
 		conn.Close()
@@ -195,9 +194,10 @@ func Upgrade(w http.ResponseWriter, r *http.Request, handler Handler, opts ...Op
 					handler.OnClose(c, err)
 					return err
 				}
-			
-				payload := make([]byte, header.Length)
+
+				payload := getPayloadBuffer(int(header.Length))
 				if _, err := io.ReadFull(br, payload); err != nil {
+					putPayloadBuffer(payload)
 					handler.OnClose(c, err)
 					return err
 				}
@@ -208,6 +208,7 @@ func Upgrade(w http.ResponseWriter, r *http.Request, handler Handler, opts ...Op
 				switch header.OpCode {
 				case ws.OpClose:
 					handler.OnClose(c, nil)
+					putPayloadBuffer(payload)
 					return io.EOF
 				case ws.OpPing:
 					handler.OnPing(c, payload)
@@ -215,7 +216,8 @@ func Upgrade(w http.ResponseWriter, r *http.Request, handler Handler, opts ...Op
 				case ws.OpPong:
 					handler.OnPong(c, payload)
 				}
-			
+				putPayloadBuffer(payload)
+
 				if br.Buffered() == 0 {
 					break
 				}
@@ -249,7 +251,7 @@ func Upgrade(w http.ResponseWriter, r *http.Request, handler Handler, opts ...Op
 				}
 
 				remaining -= int64(n)
-				
+
 				// Final chunk is when it's the frame's Fin AND no more data remains in this frame
 				isFinalChunk := header.Fin && (remaining == 0)
 

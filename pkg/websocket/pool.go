@@ -1,7 +1,6 @@
 package websocket
 
 import (
-	"math/bits"
 	"sync"
 )
 
@@ -47,33 +46,16 @@ func getPayloadBuffer(size int) []byte {
 // putPayloadBuffer returns the buffer to the appropriate pool.
 func putPayloadBuffer(buf []byte) {
 	c := cap(buf)
-	if c <= 512 {
-		b := buf[:512]
-		pool512b.Put(&b)
-		return
+	switch c {
+	case 512:
+		pool512b.Put(&buf)
+	case 4096:
+		pool4k.Put(&buf)
+	case 16 * 1024:
+		pool16k.Put(&buf)
+	case 64 * 1024:
+		pool64k.Put(&buf)
+	default:
+		// Do nothing for buffers that don't match our bucket sizes (let GC collect them)
 	}
-	if c <= 4096 {
-		b := buf[:4096]
-		pool4k.Put(&b)
-		return
-	}
-	if c <= 16*1024 {
-		b := buf[:16*1024]
-		pool16k.Put(&b)
-		return
-	}
-	if c <= 64*1024 {
-		b := buf[:64*1024]
-		pool64k.Put(&b)
-		return
-	}
-	// Do nothing for larger buffers (let GC collect them)
-}
-
-// NextPowerOf2 is a helper (if needed in future)
-func nextPowerOf2(n int) int {
-	if n <= 0 {
-		return 1
-	}
-	return 1 << (32 - bits.LeadingZeros32(uint32(n-1)))
 }

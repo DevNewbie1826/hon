@@ -135,6 +135,7 @@ func NewEngine(handler http.Handler, opts ...Option) *Engine {
 }
 
 // ReleaseConnectionState returns buffers to the engine's pools and the state to the global pool.
+// ReleaseConnectionState는 버퍼를 엔진 풀로 반환하고 상태 객체를 글로벌 풀로 반환합니다.
 func (e *Engine) ReleaseConnectionState(s *ConnectionState) {
 	if s.Reader != nil {
 		e.readerPool.Put(s.Reader)

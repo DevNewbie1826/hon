@@ -326,22 +326,19 @@ func (w *ResponseWriter) ensureHeaderSent() error {
 	if statusText == "" {
 		statusText = "status code " + strconv.Itoa(w.statusCode)
 	}
-	headerLine := "HTTP/1.1 " + strconv.Itoa(w.statusCode) + " " + statusText + "\r\n"
 
-	if _, err := w.bufWriter.Write([]byte(headerLine)); err != nil {
+	// Optimization: Use WriteString to avoid []byte(string) allocation
+	if _, err := w.bufWriter.WriteString("HTTP/1.1 " + strconv.Itoa(w.statusCode) + " " + statusText + "\r\n"); err != nil {
 		return err
 	}
 
 	// Optimization: Write Date header directly to buffer if not present in map.
-	// This avoids map allocation/access overhead for every request.
 	if w.header.Get("Date") == "" {
 		if _, err := w.bufWriter.Write(headerDate); err != nil {
 			return err
 		}
-		if _, err := w.bufWriter.WriteString(currentDate.Load().(string)); err != nil {
-			return err
-		}
-		if _, err := w.bufWriter.Write(crlf); err != nil {
+		// currentDate.Load().(string) is already a string, WriteString is perfect here.
+		if _, err := w.bufWriter.WriteString(currentDate.Load().(string) + "\r\n"); err != nil {
 			return err
 		}
 	}
