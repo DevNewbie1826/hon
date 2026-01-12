@@ -33,23 +33,47 @@ func CheckRequest(data []byte) CheckResult {
 	isChunked := false
 
 	// 2. 주요 헤더 스캔 (Content-Length / Transfer-Encoding)
-	lines := bytes.Split(headers, []byte("\r\n"))
-	if len(lines) > 1 {
-		for _, line := range lines[1:] {
-			// Content-Length 확인
-			if len(line) > len(headerCL) && bytes.EqualFold(line[:len(headerCL)], headerCL) {
-				val := bytes.TrimSpace(line[len(headerCL):])
-				if cl, err := strconv.Atoi(string(val)); err == nil {
-					contentLength = cl
-				}
-				continue
+	// Zero-Alloc Iterator: Scan headers line by line
+	// headers slice contains everything up to \r\n\r\n
+	
+	// Skip Request Line (First line)
+	cur := headers
+	if idx := bytes.Index(cur, []byte("\r\n")); idx != -1 {
+		cur = cur[idx+2:]
+	} else {
+		// No CRLF in headers? Should not happen if headerEndIdx was found
+		return CheckResult{Complete: false}
+	}
+
+	for len(cur) > 0 {
+		var line []byte
+		idx := bytes.Index(cur, []byte("\r\n"))
+		if idx != -1 {
+			line = cur[:idx]
+			cur = cur[idx+2:]
+		} else {
+			// Last line (headers slice might exclude the final CRLF)
+			line = cur
+			cur = nil
+		}
+
+		// Check for Content-Length
+		if len(line) > len(headerCL) && bytes.EqualFold(line[:len(headerCL)], headerCL) {
+			// Parse value: Trim spaces
+			val := line[len(headerCL):]
+			val = bytes.TrimSpace(val)
+			if cl, err := strconv.Atoi(string(val)); err == nil {
+				contentLength = cl
 			}
-			// Transfer-Encoding 확인
-			if len(line) > len(headerTE) && bytes.EqualFold(line[:len(headerTE)], headerTE) {
-				val := bytes.TrimSpace(line[len(headerTE):])
-				if bytes.Contains(bytes.ToLower(val), valChunked) {
-					isChunked = true
-				}
+			continue
+		}
+
+		// Check for Transfer-Encoding
+		if len(line) > len(headerTE) && bytes.EqualFold(line[:len(headerTE)], headerTE) {
+			val := line[len(headerTE):]
+			val = bytes.TrimSpace(val)
+			if bytes.Contains(bytes.ToLower(val), valChunked) {
+				isChunked = true
 			}
 		}
 	}
@@ -57,11 +81,57 @@ func CheckRequest(data []byte) CheckResult {
 	// 3. 바디 완성 여부 판단
 	if isChunked {
 		bodyData := data[headerBodySep:]
-		chunkEndIdx := bytes.Index(bodyData, chunkEnd)
-		if chunkEndIdx != -1 {
-			return CheckResult{Complete: true, BytesConsumed: headerBodySep + chunkEndIdx + 5}
+		offset := 0
+		
+		for {
+			// Find CRLF at end of chunk size line
+			idx := bytes.Index(bodyData[offset:], []byte("\r\n"))
+			if idx == -1 {
+				return CheckResult{Complete: false}
+			}
+			
+			// Parse Chunk Size (hex)
+			// Handle Chunk Extensions: Size is before first semicolon if present
+			line := bodyData[offset : offset+idx]
+			if semi := bytes.IndexByte(line, ';'); semi != -1 {
+				line = line[:semi]
+			}
+			
+			// Trim spaces (though RFC says no spaces allowed before size)
+			line = bytes.TrimSpace(line)
+			
+			chunkSize, err := strconv.ParseInt(string(line), 16, 64)
+			if err != nil {
+				// Malformed chunk size
+				return CheckResult{Error: err, Complete: false}
+			}
+
+			// Move past CRLF
+			offset += idx + 2
+
+			if chunkSize == 0 {
+				// Last chunk found. Now look for Trailer termination (Empty line)
+				// The trailer part ends with CRLF.
+				// Since we just consumed the CRLF after "0", we look for the next "\r\n".
+				// If there are no trailers, the next bytes should be "\r\n".
+				
+				trailerEnd := bytes.Index(bodyData[offset:], []byte("\r\n"))
+				if trailerEnd == -1 {
+					return CheckResult{Complete: false}
+				}
+				
+				// Found the final CRLF.
+				totalConsumed := headerBodySep + offset + trailerEnd + 2
+				return CheckResult{Complete: true, BytesConsumed: totalConsumed}
+			}
+
+			// Skip Chunk Data + CRLF
+			// Check if we have enough data
+			if len(bodyData[offset:]) < int(chunkSize)+2 {
+				return CheckResult{Complete: false}
+			}
+			offset += int(chunkSize) + 2
 		}
-		return CheckResult{Complete: false}
 	}
 
 	if contentLength >= 0 {

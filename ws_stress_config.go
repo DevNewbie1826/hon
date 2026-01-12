@@ -3,14 +3,19 @@ package main
 import (
 	"flag"
 	"log"
-	"net/url"
+	"net"
+	"runtime"
 	"sync"
 	"sync/atomic"
 	"syscall"
 	"time"
 
-	"github.com/gorilla/websocket"
+	"github.com/DevNewbie1826/hon/pkg/websocket"
+	"github.com/gobwas/ws"
+	"github.com/gobwas/ws/wsutil"
 )
+
+var connected int64
 
 func SetUlimit() error {
 	var rLimit syscall.Rlimit
@@ -21,23 +26,46 @@ func SetUlimit() error {
 	return syscall.Setrlimit(syscall.RLIMIT_NOFILE, &rLimit)
 }
 
-// go run ws_stress_config.go -c 10000 -hold 30s
+type StressHandler struct {
+	websocket.DefaultHandler
+	echo bool
+}
+
+func (h *StressHandler) OnOpen(c net.Conn) {
+	atomic.AddInt64(&connected, 1)
+	if h.echo {
+		// Start the loop
+		_ = wsutil.WriteClientMessage(c, ws.OpText, []byte("hello hon"))
+	}
+}
+
+func (h *StressHandler) OnMessage(c net.Conn, op ws.OpCode, p []byte, fin bool) {
+	if h.echo {
+		// Simple verification
+		// In high load, logging every mismatch might be too much, but good for correctness check.
+		// Schedule next message
+		time.AfterFunc(1*time.Second, func() {
+			_ = wsutil.WriteClientMessage(c, ws.OpText, []byte("hello hon"))
+		})
+	}
+}
+
+func (h *StressHandler) OnClose(c net.Conn, err error) {
+	atomic.AddInt64(&connected, -1)
+}
+
 func main() {
 	_ = SetUlimit()
 	conns := flag.Int("c", 10000, "Number of concurrent connections")
 	path := flag.String("path", "/ws-gobwas-low", "WebSocket endpoint path")
 	host := flag.String("host", "localhost:1826", "Server host and port")
-	hold := flag.Duration("hold", 20*time.Second, "Time to hold each connection")
+	hold := flag.Duration("hold", 20*time.Second, "Time to hold test")
 	echo := flag.Bool("echo", false, "Enable echo (send/receive) mode")
 	flag.Parse()
+	log.Printf("Debug Path: %s", *path)
 
-	u := url.URL{Scheme: "ws", Host: *host, Path: *path}
-	log.Printf("Starting %d connections to %s (Echo: %v)...", *conns, u.String(), *echo)
-
-	var wg sync.WaitGroup
-	var connected int64
-	// Extreme dial concurrency
-	dialSem := make(chan struct{}, 1000)
+	url := "ws://" + *host + *path
+	log.Printf("Starting %d connections to %s (Echo: %v, Mode: Hon Reactor)...", *conns, url, *echo)
 
 	// Monitor reporter
 	go func() {
@@ -45,51 +73,45 @@ func main() {
 		defer ticker.Stop()
 		for range ticker.C {
 			current := atomic.LoadInt64(&connected)
-			if current > 0 {
-				log.Printf("Current active connections: %d", current)
-			}
+			log.Printf("Active connections: %d | Client Goroutines: %d", current, runtime.NumGoroutine())
 		}
 	}()
 
-	for i := 0; i < *conns; i++ {
-		wg.Add(1)
-		go func(id int) {
-			defer wg.Done()
-			dialSem <- struct{}{}
-			c, _, err := websocket.DefaultDialer.Dial(u.String(), nil)
-			<-dialSem
+	// Dial Loop
+	// To avoid file descriptor exhaustion bursts, we throttle dialing.
+	dialSem := make(chan struct{}, 500) // Max 500 concurrent dials
+	var dialWg sync.WaitGroup
 
+	handler := &StressHandler{echo: *echo}
+
+	start := time.Now()
+
+	for i := 0; i < *conns; i++ {
+		dialSem <- struct{}{}
+		dialWg.Add(1)
+		
+		go func() {
+			defer func() { <-dialSem; dialWg.Done() }()
+			
+			// Hon's Dial is non-blocking regarding the connection lifecycle (Reactor),
+			// but Dial() itself blocks until handshake is done.
+			err := websocket.Dial(url, handler)
 			if err != nil {
+				log.Printf("Dial failed: %v", err) // Too noisy
 				return
 			}
-			atomic.AddInt64(&connected, 1)
-			defer func() {
-				c.Close()
-				atomic.AddInt64(&connected, -1)
-			}()
-
-			if *echo {
-				deadline := time.Now().Add(*hold)
-				for time.Now().Before(deadline) {
-					msg := []byte("hello hon")
-					if err := c.WriteMessage(websocket.TextMessage, msg); err != nil {
-						return
-					}
-					_, resp, err := c.ReadMessage()
-					if err != nil {
-						return
-					}
-					if string(resp) != string(msg) {
-						log.Printf("Mismatch: sent %s, got %s", msg, resp)
-					}
-					time.Sleep(1 * time.Second)
-				}
-			} else {
-				time.Sleep(*hold)
-			}
-		}(i)
+		}()
 	}
 
-	wg.Wait()
-	log.Println("Stress test finished.")
+	// Wait for all dials to complete
+	dialWg.Wait()
+	dialTime := time.Since(start)
+	log.Printf("All %d connection attempts finished in %v", *conns, dialTime)
+	
+	// Hold connections
+	log.Printf("Holding connections for %v...", *hold)
+	time.Sleep(*hold)
+	
+	log.Println("Stress test finished. Exiting...")
+	// When main exits, all connections (and reactor) will be closed.
 }

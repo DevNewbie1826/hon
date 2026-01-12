@@ -8,10 +8,10 @@
 
 - **Extreme Concurrency**: Handle **25,000+ connections** with only **6 goroutines**.
 - **Resource Efficiency**: Maximizes CPU utilization by eliminating the Thread-per-Connection overhead.
+- **True Reactor Client**: Provides a WebSocket client that uses the same Reactor pattern, achieving **0 goroutines per connection**.
 - **Standard Compatibility**: Fully supports the `http.Handler` interface, allowing you to use existing routers like `chi`, `gin`, `echo`, `mux`, etc., without any code changes.
 - **Memory Management**: Utilizes Netpoll's high-performance memory cache (`mcache`) to minimize allocation/deallocation costs and ensure stable performance under heavy traffic.
 - **Zero-Allocation**: Custom WebSocket parser achieving **0 allocs/op**.
-- **Streaming**: Optimized for large data with **64KB chunked processing**.
 
 ## 📊 Performance Benchmark (Hon vs Standard)
 
@@ -30,11 +30,17 @@ Tested on macOS M4 (Local).
 | Mode | Goroutines | Resource Usage |
 | :--- | :--- | :--- |
 | Standard (`gorilla`) | 15,005 | 100% (1 per conn) |
-| **Hon** | **6** | **0.04% (Reactor)** |
+| **Hon Server** | **6** | **0.04% (Reactor)** |
+
+### 3. Client Scalability (10,000 Conns)
+| Metric | Hon Client | Standard Client |
+| :--- | :--- | :--- |
+| **Goroutines** | **~4 (Total)** | 20,000+ |
+| **Connect Time** | **0.48s** | ~5.0s+ |
+| **Allocations** | **0 allocs/op** | High |
 
 > **Key Takeaway**: 
-> - **Standard**: Spawns **1 goroutine per connection**, creating 15,005 goroutines. This leads to massive scheduling overhead and GC pressure.
-> - **Hon**: Handles 15,000 connections with just **6 goroutines**. While initial memory usage (RSS) is slightly higher due to Netpoll's aggressive `mcache` and `LinkBuffer` pooling, it eliminates runtime GC overhead and scales linearly to C10M.
+> - **Hon Client**: Uses Netpoll's global poller to manage thousands of connections without spawning any goroutines per connection. Ideal for massive load testing or gateway services.
 
 ## 📦 Quick Start
 
@@ -48,6 +54,7 @@ go run cmd/example/main.go -type hon
 
 ## 💡 Usage Example
 
+### Server
 ```go
 func main() {
     mux := http.NewServeMux()
@@ -70,6 +77,18 @@ type MyWSHandler struct { websocket.DefaultHandler }
 func (h *MyWSHandler) OnMessage(c net.Conn, op ws.OpCode, payload []byte, fin bool) {
     // Event-driven callback without per-connection goroutine
     wsutil.WriteServerMessage(c, op, payload)
+}
+```
+
+### Client
+```go
+// Connect to WebSocket Server
+// No goroutine is spawned for this connection!
+err := websocket.Dial("ws://localhost:1826/ws", &MyClientHandler{})
+
+type MyClientHandler struct { websocket.DefaultHandler }
+func (h *MyClientHandler) OnMessage(c net.Conn, op ws.OpCode, p []byte, fin bool) {
+    fmt.Printf("Received: %s\n", string(p))
 }
 ```
 

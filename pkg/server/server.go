@@ -3,6 +3,7 @@ package server
 import (
 	"context"
 	"log"
+	"sync/atomic"
 	"time"
 
 	"github.com/DevNewbie1826/hon/pkg/engine"
@@ -18,11 +19,20 @@ type Server struct {
 	keepAliveTimeout time.Duration     // Timeout for idle connections. // 유휴 연결에 대한 타임아웃입니다.
 	readTimeout      time.Duration     // Timeout for reading request data. // 요청 데이터 읽기에 대한 타임아웃입니다.
 	writeTimeout     time.Duration     // Timeout for writing response data. // 응답 데이터 쓰기에 대한 타임아웃입니다.
+	maxConns         int32             // Maximum concurrent connections.
+	connsCount       int32             // Current connection count.
 }
 
 // Option is a function type for configuring the Server.
 // Option은 서버 설정을 위한 함수 타입입니다.
 type Option func(*Server)
+
+// WithMaxConns sets the maximum number of concurrent connections.
+func WithMaxConns(n int32) Option {
+	return func(s *Server) {
+		s.maxConns = n
+	}
+}
 
 // WithReadTimeout sets the read timeout.
 // WithReadTimeout은 읽기 타임아웃을 설정합니다.
@@ -56,6 +66,7 @@ func NewServer(e *engine.Engine, opts ...Option) *Server {
 		keepAliveTimeout: 30 * time.Second, // Default
 		readTimeout:      10 * time.Second,
 		writeTimeout:     10 * time.Second,
+		maxConns:         10000,
 	}
 
 	for _, opt := range opts {
@@ -80,13 +91,23 @@ func (s *Server) Serve(addr string) error {
 		return err
 	}
 
-	log.Printf("Server listening on %s", addr)
+	log.Printf("Server listening on %s (MaxConns: %d)", addr, s.maxConns)
 
 	opts := []netpoll.Option{
 		netpoll.WithIdleTimeout(s.keepAliveTimeout),
 		netpoll.WithOnPrepare(func(conn netpoll.Connection) context.Context {
+			// Connection Limiter
+			current := atomic.AddInt32(&s.connsCount, 1)
+			if s.maxConns > 0 && current > s.maxConns {
+				atomic.AddInt32(&s.connsCount, -1)
+				conn.Close()
+				return nil
+			}
+
 			if err := conn.SetReadTimeout(s.readTimeout); err != nil {
-				log.Printf("Warning: Failed to set read timeout on new connection: %v", err)
+				log.Printf("Failed to set read timeout: %v. Closing connection.", err)
+				conn.Close()
+				return nil
 			}
 			if s.writeTimeout > 0 {
 				conn.SetWriteTimeout(s.writeTimeout)
@@ -103,6 +124,9 @@ func (s *Server) Serve(addr string) error {
 			return ctx
 		}),
 		netpoll.WithOnDisconnect(func(ctx context.Context, connection netpoll.Connection) {
+			// Decrement connection count
+			atomic.AddInt32(&s.connsCount, -1)
+
 			// Retrieve and release ConnectionState resources
 			// ConnectionState 리소스를 검색하고 해제합니다.
 			val := ctx.Value(engine.CtxKeyConnectionState)
@@ -123,6 +147,7 @@ func (s *Server) Serve(addr string) error {
 			s.Engine.ReleaseConnectionState(state)
 		}),
 	}
+
 
 	// OnRequest callback invokes the Engine's ServeConn method.
 	// OnRequest 콜백은 Engine의 ServeConn 메서드를 호출합니다.

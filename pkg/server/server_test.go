@@ -1,7 +1,8 @@
 package server
 
 import (
-	"io"
+	"context"
+	"net"
 	"net/http"
 	"testing"
 	"time"
@@ -9,51 +10,52 @@ import (
 	"github.com/DevNewbie1826/hon/pkg/engine"
 )
 
-func TestServer_Integration(t *testing.T) {
-	// 1. Find a free port
-	// 0 port means OS chooses a free port, but netpoll/reuseport might need explicit port or handling.
-	// Let's try port 0.
-	addr := "localhost:18888" // Use a likely free port or 0 if supported well
-
-	// 2. Setup Server
-	handler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+func TestServer_ServeAndShutdown(t *testing.T) {
+	mux := http.NewServeMux()
+	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusOK)
-		w.Write([]byte("Integration Test"))
 	})
-	eng := engine.NewEngine(handler)
-	srv := NewServer(eng)
+	eng := engine.NewEngine(mux)
+	
+	// Use Options
+	srv := NewServer(eng, 
+		WithReadTimeout(1*time.Second),
+		WithWriteTimeout(1*time.Second),
+		WithKeepAliveTimeout(1*time.Second),
+	)
 
-	// 3. Start Server in a goroutine
+	// Start server in goroutine
 	go func() {
-		if err := srv.Serve(addr); err != nil {
-			// This might fail if test runs multiple times quickly on same port or port in use.
-			// Ideally we use listener on port 0, get addr, then serve.
-			// But Serve() creates listener internally.
-			t.Logf("Server stopped: %v", err)
+		if err := srv.Serve(":19999"); err != nil {
+			// Serve might return error on shutdown, which is expected
 		}
 	}()
 
-	// Give server some time to start
+	// Wait for server to start
 	time.Sleep(100 * time.Millisecond)
 
-	// 4. Send Request using standard http client
-	resp, err := http.Get("http://" + addr)
+	// Make a request
+	conn, err := net.Dial("tcp", "127.0.0.1:19999")
 	if err != nil {
-		t.Fatalf("http.Get failed: %v", err)
+		t.Fatalf("Failed to connect: %v", err)
 	}
-	defer resp.Body.Close()
-
-	// 5. Verify Response
-	if resp.StatusCode != http.StatusOK {
-		t.Errorf("Expected 200 OK, got %d", resp.StatusCode)
+	conn.Write([]byte("GET / HTTP/1.1\r\nHost: localhost\r\n\r\n"))
+	
+buf := make([]byte, 1024)
+	n, err := conn.Read(buf)
+	if err != nil {
+		t.Fatalf("Read failed: %v", err)
 	}
-
-	body, _ := io.ReadAll(resp.Body)
-	if string(body) != "Integration Test" {
-		t.Errorf("Expected body 'Integration Test', got '%s'", string(body))
+	response := string(buf[:n])
+	if response[:15] != "HTTP/1.1 200 OK" {
+		t.Errorf("Unexpected response: %s", response)
 	}
+	conn.Close()
 
-	// 6. Shutdown (Not fully implemented in our Server struct to stop Serve loop easily from outside without ctx)
-	// Currently srv.Shutdown(ctx) is implemented but srv.Serve() blocks.
-	// The test ends, killing the goroutine eventually.
+	// Shutdown
+	ctx, cancel := context.WithTimeout(context.Background(), 1*time.Second)
+	defer cancel()
+	if err := srv.Shutdown(ctx); err != nil {
+		t.Errorf("Shutdown failed: %v", err)
+	}
 }

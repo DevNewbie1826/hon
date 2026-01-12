@@ -144,6 +144,7 @@ func TestOnCloseOnce(t *testing.T) {
 	req.Header.Set("Connection", "Upgrade")
 	req.Header.Set("Upgrade", "websocket")
 	req.Header.Set("Sec-WebSocket-Key", "key")
+	req.Header.Set("Sec-WebSocket-Version", "13")
 	
 	Upgrade(mh, req, handler)
 
@@ -168,6 +169,7 @@ func TestOnClose_IsActive(t *testing.T) {
 	req.Header.Set("Connection", "Upgrade")
 	req.Header.Set("Upgrade", "websocket")
 	req.Header.Set("Sec-WebSocket-Key", "key")
+	req.Header.Set("Sec-WebSocket-Version", "13")
 	
 	Upgrade(mh, req, handler)
 
@@ -208,18 +210,21 @@ func TestStreamingLargePayload(t *testing.T) {
 	req.Header.Set("Connection", "Upgrade")
 	req.Header.Set("Upgrade", "websocket")
 	req.Header.Set("Sec-WebSocket-Key", "key")
+	req.Header.Set("Sec-WebSocket-Version", "13")
 	
 	Upgrade(mh, req, handler)
 
 	mh.ReadHandler(mc, rw)
 
-	if atomic.LoadInt32(&handler.CloseCnt) != 0 {
-		t.Errorf("OnClose called unexpectedly: %v", handler.LastErr)
-	}
 	// 70KB payload split into 64KB chunks -> ceil(70/64) = 2 chunks (64KB + 6KB)
 	expectedChunks := int32(2)
 	if atomic.LoadInt32(&handler.MessageCnt) != expectedChunks {
 		t.Errorf("OnMessage called %d times, expected %d", handler.MessageCnt, expectedChunks)
+	}
+
+	// Connection closes normally after EOF
+	if atomic.LoadInt32(&handler.CloseCnt) != 1 {
+		t.Errorf("Expected 1 close after EOF, got %d", handler.CloseCnt)
 	}
 }
 
@@ -244,6 +249,7 @@ func TestMultiplexing_PingPongData(t *testing.T) {
 	req.Header.Set("Connection", "Upgrade")
 	req.Header.Set("Upgrade", "websocket")
 	req.Header.Set("Sec-WebSocket-Key", "key")
+	req.Header.Set("Sec-WebSocket-Version", "13")
 	
 	Upgrade(mh, req, handler)
 
@@ -293,6 +299,7 @@ func TestFragmentedMessages(t *testing.T) {
 	req.Header.Set("Connection", "Upgrade")
 	req.Header.Set("Upgrade", "websocket")
 	req.Header.Set("Sec-WebSocket-Key", "key")
+	req.Header.Set("Sec-WebSocket-Version", "13")
 	
 	Upgrade(mh, req, handler)
 	mh.ReadHandler(mc, rw)
@@ -327,6 +334,7 @@ func TestHandleError_ControlFrameTooLarge(t *testing.T) {
 	req.Header.Set("Connection", "Upgrade")
 	req.Header.Set("Upgrade", "websocket")
 	req.Header.Set("Sec-WebSocket-Key", "key")
+	req.Header.Set("Sec-WebSocket-Version", "13")
 	
 	Upgrade(mh, req, handler)
 	mh.ReadHandler(mc, rw)

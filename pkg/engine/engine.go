@@ -8,6 +8,7 @@ import (
 	"log"
 	"net/http"
 	"runtime/debug"
+	"strings"
 	"sync"
 	"sync/atomic" // atomic 패키지 임포트 추가
 	"time"
@@ -192,7 +193,10 @@ func (e *Engine) ServeConn(ctx context.Context, conn netpoll.Connection) error {
 			// We ignore the error here as the handler should handle it or close the connection
 			// 핸들러가 오류를 처리하거나 연결을 닫아야 하므로, 여기서 오류는 무시합니다.
 			if err := state.ReadHandler(conn, rw); err != nil {
-				log.Printf("ReadHandler error: %v", err)
+				// Suppress normal EOF errors to reduce log noise
+				if err != io.EOF && !strings.Contains(err.Error(), "EOF") {
+					log.Printf("ReadHandler error: %v", err)
+				}
 				conn.Close() // Ensure connection is closed on error
 			}
 		}()
@@ -209,9 +213,17 @@ func (e *Engine) ServeConn(ctx context.Context, conn netpoll.Connection) error {
 // serveHTTP handles HTTP requests in a goroutine.
 // serveHTTP는 고루틴에서 HTTP 요청을 처리합니다.
 func (e *Engine) serveHTTP(ctx context.Context, conn netpoll.Connection, state *ConnectionState) {
-	// Loop to handle pipelined requests or buffered data
-	// 파이프라인된 요청 또는 버퍼링된 데이터를 처리하기 위한 루프입니다.
+	// Panic Recovery for HTTP Handler
+	defer func() {
+		if r := recover(); r != nil {
+			log.Printf("[Panic] Recovered in serveHTTP: %v\n%s", r, debug.Stack())
+			conn.Close()
+			state.Processing.Store(false)
+		}
+	}()
+
 	for {
+		// ... existing logic ...
 		// Check if connection is closed before processing
 		// 처리 전에 연결이 닫혔는지 확인합니다.
 		if !conn.IsActive() {
