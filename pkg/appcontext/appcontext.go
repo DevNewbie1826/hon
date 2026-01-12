@@ -15,11 +15,11 @@ type ReadHandler func(conn netpoll.Connection, rw *bufio.ReadWriter) error
 // RequestContext holds all necessary information during the lifecycle of an HTTP request.
 // RequestContext는 HTTP 요청의 전체 생명주기 동안 필요한 모든 정보를 담습니다.
 type RequestContext struct {
-	conn             netpoll.Connection      // The underlying netpoll connection. // 기반 netpoll 연결입니다.
-	req              context.Context         // Parent context for the request. // 요청에 대한 부모 컨텍스트입니다.
-	reader           *bufio.Reader           // Reusable buffered reader for the connection. // 연결을 위한 재사용 가능한 버퍼링된 리더입니다.
-	writer           *bufio.Writer           // Reusable buffered writer for the connection. // 연결을 위한 재사용 가능한 버퍼링된 라이터입니다.
-	onSetReadHandler func(ReadHandler)       // Callback for when a custom read handler is set. // 사용자 정의 읽기 핸들러가 설정될 때 호출되는 콜백입니다.
+	conn             netpoll.Connection // The underlying netpoll connection. // 기반 netpoll 연결입니다.
+	req              context.Context    // Parent context for the request. // 요청에 대한 부모 컨텍스트입니다.
+	reader           *bufio.Reader      // Reusable buffered reader for the connection. // 연결을 위한 재사용 가능한 버퍼링된 리더입니다.
+	writer           *bufio.Writer      // Reusable buffered writer for the connection. // 연결을 위한 재사용 가능한 버퍼링된 라이터입니다.
+	onSetReadHandler func(ReadHandler)  // Callback for when a custom read handler is set. // 사용자 정의 읽기 핸들러가 설정될 때 호출되는 콜백입니다.
 }
 
 // pool recycles RequestContext objects to reduce GC pressure.

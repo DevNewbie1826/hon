@@ -66,7 +66,7 @@ func NewServer(e *engine.Engine, opts ...Option) *Server {
 		keepAliveTimeout: 30 * time.Second, // Default
 		readTimeout:      10 * time.Second,
 		writeTimeout:     10 * time.Second,
-		maxConns:         10000,
+		maxConns:         0, // Default: Unlimited
 	}
 
 	for _, opt := range opts {
@@ -147,7 +147,6 @@ func (s *Server) Serve(addr string) error {
 			s.Engine.ReleaseConnectionState(state)
 		}),
 	}
-
 
 	// OnRequest callback invokes the Engine's ServeConn method.
 	// OnRequest 콜백은 Engine의 ServeConn 메서드를 호출합니다.

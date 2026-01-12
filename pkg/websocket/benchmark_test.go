@@ -12,11 +12,11 @@ import (
 type MockNetpollConn struct {
 	netpoll.Connection
 	r netpoll.Reader
-	w *bytes.Buffer
+	w netpoll.Writer
 }
 
 func (m *MockNetpollConn) Reader() netpoll.Reader { return m.r }
-func (m *MockNetpollConn) Writer() netpoll.Writer { return netpoll.NewWriter(m.w) }
+func (m *MockNetpollConn) Writer() netpoll.Writer { return m.w }
 func (m *MockNetpollConn) IsActive() bool         { return true }
 func (m *MockNetpollConn) Close() error           { return nil }
 
@@ -37,34 +37,30 @@ func BenchmarkServeReactor(b *testing.B) {
 	handler := &DefaultHandler{}
 	cfg := &Config{}
 
-	// Use LinkBuffer which implements netpoll.Reader fully
+	// Use LinkBuffer which implements Reader and Writer fully
 	lb := netpoll.NewLinkBuffer()
 
 	mockConn := &MockNetpollConn{
 		r: lb,
-		w: bytes.NewBuffer(nil),
+		w: lb,
 	}
 
 	b.ResetTimer()
 	b.ReportAllocs()
 
+	assembler := NewAssembler(cfg)
 	for i := 0; i < b.N; i++ {
 		// Fill buffer
 		lb.WriteBinary(frameBytes)
-		// No Flush needed for LinkBuffer write to be readable?
-		// LinkBuffer.Flush() flushes to underlying writer, but here we write directly to it.
-		// LinkBuffer implements Read/Write so writing to it makes data readable.
 		lb.Flush()
 
-		// Run Reactor Logic
-		_ = ServeReactor(mockConn, handler, cfg)
-
-		// Reset buffer? ServeReactor consumes it.
+		// Run Reactor Logic (Unified ServeConn)
+		_ = ServeConn(mockConn, nil, handler, cfg, assembler)
 	}
 }
 
-// BenchmarkReadHeaderNetpoll measures header parsing allocations
-func BenchmarkReadHeaderNetpoll(b *testing.B) {
+// BenchmarkParseHeader measures header parsing allocations (Replacement for ReadHeaderNetpoll)
+func BenchmarkParseHeader(b *testing.B) {
 	frame := bytes.NewBuffer(nil)
 	ws.WriteHeader(frame, ws.Header{
 		Fin:    true,
@@ -73,19 +69,10 @@ func BenchmarkReadHeaderNetpoll(b *testing.B) {
 	})
 	headerBytes := frame.Bytes()
 
-	lb := netpoll.NewLinkBuffer()
-
 	b.ResetTimer()
 	b.ReportAllocs()
 
 	for i := 0; i < b.N; i++ {
-		lb.WriteBinary(headerBytes)
-		lb.Flush()
-
-		_, _, _ = readHeaderNetpoll(lb)
-
-		// Should we release or reset?
-		// ServeReactor/readHeader consumes data (Skip/Next).
-		// LinkBuffer automatically manages memory.
+		_, _, _ = parseHeader(headerBytes)
 	}
 }

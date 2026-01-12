@@ -7,17 +7,16 @@ import (
 	"log"
 	"net"
 	"net/http"
-	_ "net/http/pprof"
 	"os"
 	"os/signal"
+	"runtime"
 	"syscall"
 	"time"
 
 	hengine "github.com/DevNewbie1826/hon/pkg/engine"
 	hserver "github.com/DevNewbie1826/hon/pkg/server"
-	hws "github.com/DevNewbie1826/hon/pkg/websocket"
+	honws "github.com/DevNewbie1826/hon/pkg/websocket"
 	"github.com/gobwas/ws"
-	"github.com/gobwas/ws/wsutil"
 	"github.com/gorilla/websocket"
 )
 
@@ -47,6 +46,17 @@ func main() {
 	serverType := flag.String("type", "hon", "Server type: hon, std")
 	flag.Parse()
 
+	// Goroutine Monitor
+	go func() {
+		for {
+			time.Sleep(2 * time.Second)
+			log.Printf("🔥 Active Goroutines: %d", runtime.NumGoroutine())
+		}
+	}()
+
+	var h http.Handler
+	_ = h // Silencing unused variable error for now
+
 	mux := http.NewServeMux()
 	mux.HandleFunc("/", rootHandler)
 
@@ -60,7 +70,7 @@ func main() {
 	mux.HandleFunc("/sse", sseHandler)
 
 	addr := ":1826"
-	
+
 	quit := make(chan os.Signal, 1)
 	signal.Notify(quit, os.Interrupt, syscall.SIGTERM)
 
@@ -90,7 +100,7 @@ func main() {
 		log.Printf("Starting Hon server on %s", addr)
 		eng := hengine.NewEngine(mux)
 		srv := hserver.NewServer(eng)
-		
+
 		go func() {
 			if err := srv.Serve(addr); err != nil {
 				log.Fatalf("Hon server failed: %v", err)
@@ -116,22 +126,20 @@ func rootHandler(w http.ResponseWriter, r *http.Request) {
 
 // --- Hon Optimized WebSocket ---
 type HonWSHandler struct {
-	hws.DefaultHandler
+	honws.DefaultHandler
 }
 
-func (h *HonWSHandler) OnMessage(c net.Conn, op ws.OpCode, payload []byte, fin bool) {
-	if err := wsutil.WriteServerMessage(c, op, payload); err != nil {
+func (h *HonWSHandler) OnMessage(c net.Conn, op ws.OpCode, payload []byte) {
+	// Enable compression for echo
+	cfg := &honws.Config{EnableCompression: true}
+	if err := honws.WriteMessage(c, op, payload, cfg); err != nil {
 		log.Printf("Hon write failed: %v", err)
 	}
 }
 
 func honWebSocketHandler(w http.ResponseWriter, r *http.Request) {
-	// Upgrade with security options
-	err := hws.Upgrade(w, r, &HonWSHandler{},
-		hws.WithCheckOrigin(func(r *http.Request) bool {
-			return true // Allow all for example, but explicit
-		}),
-	)
+	// Upgrade to WebSocket with Compression enabled
+	err := honws.Upgrade(w, r, &HonWSHandler{}, honws.WithEnableCompression(true))
 	if err != nil {
 		log.Printf("Hon upgrade failed: %v", err)
 	}
@@ -156,10 +164,11 @@ func gorillaStdHandler(w http.ResponseWriter, r *http.Request) {
 			if err != nil {
 				return
 			}
-						if err := conn.WriteMessage(mt, msg); err != nil {
-							log.Printf("Gorilla write failed: %v", err)
-							return
-						}		}
+			if err := conn.WriteMessage(mt, msg); err != nil {
+				log.Printf("Gorilla write failed: %v", err)
+				return
+			}
+		}
 	}()
 }
 
@@ -182,12 +191,13 @@ func sseHandler(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
 
 	for i := 0; i < 10; i++ {
-				select {
-				case <-ctx.Done():
-					log.Println("SSE client disconnected")
-					return
-				case <-ticker.C:
-					fmt.Fprintf(w, "data: Message %d\n\n", i)
-					flusher.Flush()
-				}	}
+		select {
+		case <-ctx.Done():
+			log.Println("SSE client disconnected")
+			return
+		case <-ticker.C:
+			fmt.Fprintf(w, "data: Message %d\n\n", i)
+			flusher.Flush()
+		}
+	}
 }

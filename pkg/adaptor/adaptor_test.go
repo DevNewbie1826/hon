@@ -23,7 +23,9 @@ func (m *MockConn) Reader() netpoll.Reader { return nil }
 func (m *MockConn) Writer() netpoll.Writer { return netpoll.NewWriter(m.buf) }
 func (m *MockConn) IsActive() bool         { return true }
 func (m *MockConn) Close() error           { return nil }
-func (m *MockConn) RemoteAddr() net.Addr   { return &net.TCPAddr{IP: net.ParseIP("127.0.0.1"), Port: 1234} }
+func (m *MockConn) RemoteAddr() net.Addr {
+	return &net.TCPAddr{IP: net.ParseIP("127.0.0.1"), Port: 1234}
+}
 func (m *MockConn) Read(p []byte) (int, error) { return 0, io.EOF }
 
 func TestResponseWriter_Write(t *testing.T) {
@@ -59,7 +61,7 @@ func TestResponseWriter_Write(t *testing.T) {
 	if !contains(resp, "Hello") {
 		t.Errorf("Body missing")
 	}
-	
+
 	rw.Release()
 }
 
@@ -70,7 +72,7 @@ func TestResponseWriter_Chunked(t *testing.T) {
 
 	rw := NewResponseWriter(ctx, nil)
 	// Do NOT set Content-Length -> Triggers Chunked
-	
+
 	rw.Write([]byte("Chunk1"))
 	rw.Write([]byte("Chunk2"))
 	rw.EndResponse()

@@ -11,7 +11,10 @@
 - **True Reactor Client**: Provides a WebSocket client that uses the same Reactor pattern, achieving **0 goroutines per connection**.
 - **Standard Compatibility**: Fully supports the `http.Handler` interface, allowing you to use existing routers like `chi`, `gin`, `echo`, `mux`, etc., without any code changes.
 - **Memory Management**: Utilizes Netpoll's high-performance memory cache (`mcache`) to minimize allocation/deallocation costs and ensure stable performance under heavy traffic.
-- **Zero-Allocation**: Custom WebSocket parser achieving **0 allocs/op**.
+- **Zero-Allocation**: 
+  - **HTTP Parser**: Custom Zero-Alloc parser achieving **0 allocs/op** (Benchmark verified).
+  - **WebSocket**: Fully pooled assembly, compression, and masking.
+  - **Adaptor**: Stack-based sniffing for `Content-Type`, eliminating heap allocations.
 
 ## 📊 Performance Benchmark (Hon vs Standard)
 
@@ -26,13 +29,20 @@ Tested on macOS M4 (Local).
 > **Analysis**: 
 > - **Hon**: Outperforms the standard Go server by **80%** by utilizing the **Reactor pattern** and efficient memory pooling.
 
-### 2. WebSocket Efficiency (15,000 Conns)
+### 2. Zero-Allocation Parser (Micro-Benchmark)
+| Component | Metric | Hon | Standard (`strconv`) |
+| :--- | :--- | :--- | :--- |
+| **Chunked Parsing** | **Allocations** | **0 allocs/op** | 1+ allocs/op |
+| **Content-Length** | **Allocations** | **0 allocs/op** | 0+ allocs/op |
+| **Parsing Speed** | **Time/Op** | **49.8 ns** | 71.7 ns |
+
+### 3. WebSocket Efficiency (15,000 Conns)
 | Mode | Goroutines | Resource Usage |
 | :--- | :--- | :--- |
 | Standard (`gorilla`) | 15,005 | 100% (1 per conn) |
 | **Hon Server** | **6** | **0.04% (Reactor)** |
 
-### 3. Client Scalability (10,000 Conns)
+### 4. Client Scalability (10,000 Conns)
 | Metric | Hon Client | Standard Client |
 | :--- | :--- | :--- |
 | **Goroutines** | **~4 (Total)** | 20,000+ |

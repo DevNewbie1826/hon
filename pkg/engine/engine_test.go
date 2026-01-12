@@ -38,19 +38,21 @@ func (m *MockConnection) IsActive() bool {
 	return !m.closed
 }
 
-func (m *MockConnection) SetReadDeadline(t time.Time) error { return nil }
-func (m *MockConnection) SetWriteDeadline(t time.Time) error { return nil }
+func (m *MockConnection) SetReadDeadline(t time.Time) error    { return nil }
+func (m *MockConnection) SetWriteDeadline(t time.Time) error   { return nil }
 func (m *MockConnection) SetReadTimeout(t time.Duration) error { return nil }
-func (m *MockConnection) RemoteAddr() net.Addr { return &net.TCPAddr{IP: net.IPv4(127, 0, 0, 1), Port: 8080} }
-// Reader returns a valid reader so conn.Reader().Len() checks works in ServeConn double-check lock
-func (m *MockConnection) Reader() netpoll.Reader {
-    // For simplicity in this mock, we can return nil or a dummy.
-    // The engine checks `if r := conn.Reader(); r != nil && r.Len() > 0`.
-    // If we want to test the double-check lock, we need a real implementation, 
-    // but for basic tests, nil is fine as long as we don't rely on that specific path.
-    return nil 
+func (m *MockConnection) RemoteAddr() net.Addr {
+	return &net.TCPAddr{IP: net.IPv4(127, 0, 0, 1), Port: 8080}
 }
 
+// Reader returns a valid reader so conn.Reader().Len() checks works in ServeConn double-check lock
+func (m *MockConnection) Reader() netpoll.Reader {
+	// For simplicity in this mock, we can return nil or a dummy.
+	// The engine checks `if r := conn.Reader(); r != nil && r.Len() > 0`.
+	// If we want to test the double-check lock, we need a real implementation,
+	// but for basic tests, nil is fine as long as we don't rely on that specific path.
+	return nil
+}
 
 // fillRequest writes a simple HTTP request to the read buffer
 func (m *MockConnection) fillRequest(method, path, body string) {
@@ -122,7 +124,7 @@ func TestEngine_ServeConn_PanicRecovery(t *testing.T) {
 	// It should also try to write a 500 response if headers weren't sent.
 	err := eng.ServeConn(ctx, conn)
 	if err != nil {
-		// ServeConn might return nil even on panic handled internally, 
+		// ServeConn might return nil even on panic handled internally,
 		// or it might close connection.
 	}
 
@@ -164,12 +166,12 @@ func TestEngine_ServeConn_KeepAlive(t *testing.T) {
 
 	// 5. Verify Responses
 	output := conn.writeBuf.String()
-	
+
 	// Check for Response 1
 	if !strings.Contains(output, "Response 1") {
 		t.Errorf("Expected Response 1, got output:\n%s", output)
 	}
-	
+
 	// Check for Response 2
 	if !strings.Contains(output, "Response 2") {
 		t.Errorf("Expected Response 2, got output:\n%s", output)
@@ -223,7 +225,7 @@ func TestEngine_RequestTimeout(t *testing.T) {
 	// 1. Setup Engine with short timeout
 	timeout := 10 * time.Millisecond
 	timeoutOccurred := make(chan bool, 1)
-	
+
 	handler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		// Simulate long work
 		select {

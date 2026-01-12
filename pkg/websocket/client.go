@@ -1,11 +1,14 @@
 package websocket
 
 import (
+	"bytes"
 	"context"
 	"crypto/rand"
 	"encoding/base64"
 	"fmt"
+	"io"
 	"net"
+	"net/http"
 	"net/url"
 	"strings"
 	"sync"
@@ -13,6 +16,8 @@ import (
 
 	"github.com/cloudwego/netpoll"
 )
+
+const maxHeaderSize = 4096 // 4KB for handshake header limit
 
 // Client manages WebSocket connections.
 type Client struct {
@@ -42,26 +47,19 @@ func (c *Client) Dial(u string, handler Handler, opts ...Option) error {
 	}
 
 	scheme := parsedURL.Scheme
-	if scheme != "ws" && scheme != "wss" {
-		return fmt.Errorf("unsupported scheme: %s", scheme)
+	if scheme != "ws" {
+		return fmt.Errorf("unsupported scheme: %s (only ws:// is supported in reactor mode)", scheme)
 	}
 
 	host := parsedURL.Host
 	if !strings.Contains(host, ":") {
-		if scheme == "wss" {
-			host += ":443"
-		} else {
-			host += ":80"
-		}
+		host += ":80"
 	}
 
-	dialer := netpoll.NewDialer()
-	conn, err := dialer.DialConnection("tcp", host, c.DialTimeout)
-	if err != nil {
-		return fmt.Errorf("dial failed: %w", err)
+	cfg := &Config{
+		MaxFrameSize: 10 * 1024 * 1024,
+		Header:       make(http.Header),
 	}
-
-	cfg := &Config{MaxFrameSize: 10 * 1024 * 1024} // Default 10MB limit
 	for _, opt := range opts {
 		opt(cfg)
 	}
@@ -76,7 +74,15 @@ func (c *Client) Dial(u string, handler Handler, opts ...Option) error {
 		once:    sync.Once{},
 	}
 
-	// Register Netpoll Close Callback to ensure OnClose is called on disconnect
+	// WS: Netpoll Reactor Mode
+	dialer := netpoll.NewDialer()
+	conn, err := dialer.DialConnection("tcp", host, c.DialTimeout)
+	if err != nil {
+		c.wg.Done()
+		return fmt.Errorf("dial failed: %w", err)
+	}
+
+	// Register Netpoll Close Callback
 	conn.AddCloseCallback(func(connection netpoll.Connection) error {
 		wrappedHandler.OnClose(connection, fmt.Errorf("connection closed"))
 		return nil
@@ -86,38 +92,31 @@ func (c *Client) Dial(u string, handler Handler, opts ...Option) error {
 	handshakeDone := make(chan error, 1)
 	isHandshake := true
 
+	// --- [KEY FIX] Assembler is created once per connection and captured in closure ---
+	assembler := NewAssembler(cfg)
+
 	err = conn.SetOnRequest(func(ctx context.Context, connection netpoll.Connection) error {
 		if isHandshake {
+			// ... (Handshake logic same as before) ...
 			reader := connection.Reader()
-
-			l := reader.Len()
-			if l == 0 {
+			available := reader.Len()
+			if available == 0 {
 				return nil
 			}
-
-			// Fix: Check Peek error
-			peekBuf, err := reader.Peek(l)
-			if err != nil {
-				// If peek fails, we can't process. Signal error if possible.
-				select {
-				case handshakeDone <- fmt.Errorf("peek failed: %w", err):
-				default:
-				}
+			peekLen := min(available, maxHeaderSize)
+			peekBuf, err := reader.Peek(peekLen)
+			if err != nil && err != netpoll.ErrEOF && err != io.EOF {
 				return err
 			}
-
-			// Search for end of headers
-			idx := strings.Index(string(peekBuf), "\r\n\r\n")
+			idx := bytes.Index(peekBuf, []byte("\r\n\r\n"))
 			if idx == -1 {
-				// Not enough data yet
+				if available > maxHeaderSize {
+					return fmt.Errorf("websocket: response header too large")
+				}
 				return nil
 			}
-
-			// We have full headers.
 			headerBytes := idx + 4
 			headerStr := string(peekBuf[:idx])
-
-			// Parse Status Line
 			lines := strings.Split(headerStr, "\r\n")
 			if len(lines) < 1 {
 				err := fmt.Errorf("empty response")
@@ -127,7 +126,6 @@ func (c *Client) Dial(u string, handler Handler, opts ...Option) error {
 				}
 				return nil
 			}
-
 			if !strings.HasPrefix(lines[0], "HTTP/1.1 101") {
 				err := fmt.Errorf("handshake failed: %s", lines[0])
 				select {
@@ -136,47 +134,33 @@ func (c *Client) Dial(u string, handler Handler, opts ...Option) error {
 				}
 				return nil
 			}
-
-			// Consume data from reader
 			reader.Skip(headerBytes)
-
-			// Fix: Race Condition - Update state BEFORE signaling
 			isHandshake = false
-
-			// Trigger OnOpen
 			wrappedHandler.OnOpen(connection)
-
-			// Signal success
 			select {
 			case handshakeDone <- nil:
 			default:
 			}
-
-			// If there is more data (frames) after headers, process them now
 			if reader.Len() > 0 {
-				return ServeReactor(connection, wrappedHandler, cfg)
+				return ServeConn(connection, nil, wrappedHandler, cfg, assembler)
 			}
 			return nil
 		}
 
-		// Frame Processing
-		// Fix: Check connection state
 		if !connection.IsActive() {
 			wrappedHandler.OnClose(connection, nil)
 			return nil
 		}
-
-		return ServeReactor(connection, wrappedHandler, cfg)
+		return ServeConn(connection, nil, wrappedHandler, cfg, assembler)
 	})
-
 	if err != nil {
 		conn.Close()
-		c.wg.Done() // Decrement since we failed to setup
+		c.wg.Done()
 		return fmt.Errorf("failed to set handler: %w", err)
 	}
 
 	// Send Handshake Request
-	if err := sendHandshake(conn, parsedURL); err != nil {
+	if err := sendHandshake(conn, parsedURL, cfg); err != nil {
 		conn.Close()
 		c.wg.Done()
 		return err
@@ -186,18 +170,12 @@ func (c *Client) Dial(u string, handler Handler, opts ...Option) error {
 	select {
 	case err := <-handshakeDone:
 		if err != nil {
-			// Ensure handler cleanup if handshake failed logic didn't trigger close
 			conn.Close()
-			// wg done is handled by OnClose wrapper if OnClose is called,
-			// but here we force close.
-			// Ideally, OnClose should be called.
 			wrappedHandler.OnClose(conn, err)
 			return err
 		}
-		// Success
 		return nil
 	case <-time.After(c.DialTimeout):
-		// Fix: Remove handler before closing to avoid race
 		conn.SetOnRequest(nil)
 		conn.Close()
 		wrappedHandler.OnClose(conn, fmt.Errorf("handshake timeout"))
@@ -224,10 +202,10 @@ func (h *clientCloseTracker) OnClose(c net.Conn, err error) {
 	})
 }
 
-func sendHandshake(conn netpoll.Connection, u *url.URL) error {
+func buildHandshakeRequest(u *url.URL, cfg *Config) (string, error) {
 	key := make([]byte, 16)
 	if _, err := rand.Read(key); err != nil {
-		return err
+		return "", err
 	}
 	secKey := base64.StdEncoding.EncodeToString(key)
 
@@ -250,10 +228,48 @@ func sendHandshake(conn netpoll.Connection, u *url.URL) error {
 	sb.WriteString("Sec-WebSocket-Key: ")
 	sb.WriteString(secKey)
 	sb.WriteString("\r\n")
-	sb.WriteString("Sec-WebSocket-Version: 13\r\n\r\n")
+	sb.WriteString("Sec-WebSocket-Version: 13\r\n")
 
+	if cfg.EnableCompression {
+		sb.WriteString("Sec-WebSocket-Extensions: per-message-deflate; client_no_context_takeover; server_no_context_takeover\r\n")
+	}
+
+	// Add Custom Headers
+	if cfg.Header != nil {
+		for k, vs := range cfg.Header {
+			for _, v := range vs {
+				sb.WriteString(k)
+				sb.WriteString(": ")
+				sb.WriteString(v)
+				sb.WriteString("\r\n")
+			}
+		}
+	}
+
+	// Add Cookies
+	if len(cfg.Cookies) > 0 {
+		sb.WriteString("Cookie: ")
+		for i, cookie := range cfg.Cookies {
+			if i > 0 {
+				sb.WriteString("; ")
+			}
+			sb.WriteString(cookie.Name)
+			sb.WriteString("=")
+			sb.WriteString(cookie.Value)
+		}
+		sb.WriteString("\r\n")
+	}
+
+	sb.WriteString("\r\n")
+	return sb.String(), nil
+}
+
+func sendHandshake(conn netpoll.Connection, u *url.URL, cfg *Config) error {
+	req, err := buildHandshakeRequest(u, cfg)
+	if err != nil {
+		return err
+	}
 	writer := conn.Writer()
-	writer.WriteString(sb.String())
-
+	writer.WriteString(req)
 	return writer.Flush()
 }

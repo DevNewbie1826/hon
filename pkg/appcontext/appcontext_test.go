@@ -23,15 +23,17 @@ type MockConnection struct {
 }
 
 func (m *MockConnection) Read(b []byte) (n int, err error)     { return m.readBuf.Read(b) }
-func (m *MockConnection) Write(b []byte) (n int, err error) { return m.writeBuf.Write(b) }
+func (m *MockConnection) Write(b []byte) (n int, err error)    { return m.writeBuf.Write(b) }
 func (m *MockConnection) Close() error                         { m.closed = true; return nil }
 func (m *MockConnection) IsActive() bool                       { return !m.closed }
 func (m *MockConnection) SetReadDeadline(t time.Time) error    { return nil }
 func (m *MockConnection) SetWriteDeadline(t time.Time) error   { return nil }
 func (m *MockConnection) SetReadTimeout(t time.Duration) error { return nil }
 func (m *MockConnection) SetIdleTimeout(t time.Duration) error { return nil }
-func (m *MockConnection) RemoteAddr() net.Addr                 { return &net.TCPAddr{IP: net.IPv4(127, 0, 0, 1), Port: 8080} }
-func (m *MockConnection) Reader() netpoll.Reader               { return nil } // Not used by appcontext
+func (m *MockConnection) RemoteAddr() net.Addr {
+	return &net.TCPAddr{IP: net.IPv4(127, 0, 0, 1), Port: 8080}
+}
+func (m *MockConnection) Reader() netpoll.Reader { return nil } // Not used by appcontext
 func (m *MockConnection) SetOnRequest(on netpoll.OnRequest) error {
 	m.onRequestCalled = true
 	return nil
@@ -73,7 +75,7 @@ func TestNewRequestContext_Release_Pool(t *testing.T) {
 	if ctx2.onSetReadHandler != nil {
 		t.Errorf("Expected onSetReadHandler to be nil after reset")
 	}
-	
+
 	ctx2.Release()
 }
 

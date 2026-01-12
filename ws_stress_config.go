@@ -12,7 +12,6 @@ import (
 
 	"github.com/DevNewbie1826/hon/pkg/websocket"
 	"github.com/gobwas/ws"
-	"github.com/gobwas/ws/wsutil"
 )
 
 var connected int64
@@ -35,17 +34,17 @@ func (h *StressHandler) OnOpen(c net.Conn) {
 	atomic.AddInt64(&connected, 1)
 	if h.echo {
 		// Start the loop
-		_ = wsutil.WriteClientMessage(c, ws.OpText, []byte("hello hon"))
+		_ = websocket.WriteClientMessage(c, ws.OpText, []byte("hello hon"), nil)
 	}
 }
 
-func (h *StressHandler) OnMessage(c net.Conn, op ws.OpCode, p []byte, fin bool) {
+func (h *StressHandler) OnMessage(c net.Conn, op ws.OpCode, p []byte) {
 	if h.echo {
 		// Simple verification
 		// In high load, logging every mismatch might be too much, but good for correctness check.
 		// Schedule next message
 		time.AfterFunc(1*time.Second, func() {
-			_ = wsutil.WriteClientMessage(c, ws.OpText, []byte("hello hon"))
+			_ = websocket.WriteClientMessage(c, ws.OpText, []byte("hello hon"), nil)
 		})
 	}
 }
@@ -89,10 +88,10 @@ func main() {
 	for i := 0; i < *conns; i++ {
 		dialSem <- struct{}{}
 		dialWg.Add(1)
-		
+
 		go func() {
 			defer func() { <-dialSem; dialWg.Done() }()
-			
+
 			// Hon's Dial is non-blocking regarding the connection lifecycle (Reactor),
 			// but Dial() itself blocks until handshake is done.
 			err := websocket.Dial(url, handler)
@@ -107,11 +106,11 @@ func main() {
 	dialWg.Wait()
 	dialTime := time.Since(start)
 	log.Printf("All %d connection attempts finished in %v", *conns, dialTime)
-	
+
 	// Hold connections
 	log.Printf("Holding connections for %v...", *hold)
 	time.Sleep(*hold)
-	
+
 	log.Println("Stress test finished. Exiting...")
 	// When main exits, all connections (and reactor) will be closed.
 }

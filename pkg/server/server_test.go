@@ -16,9 +16,9 @@ func TestServer_ServeAndShutdown(t *testing.T) {
 		w.WriteHeader(http.StatusOK)
 	})
 	eng := engine.NewEngine(mux)
-	
+
 	// Use Options
-	srv := NewServer(eng, 
+	srv := NewServer(eng,
 		WithReadTimeout(1*time.Second),
 		WithWriteTimeout(1*time.Second),
 		WithKeepAliveTimeout(1*time.Second),
@@ -40,8 +40,8 @@ func TestServer_ServeAndShutdown(t *testing.T) {
 		t.Fatalf("Failed to connect: %v", err)
 	}
 	conn.Write([]byte("GET / HTTP/1.1\r\nHost: localhost\r\n\r\n"))
-	
-buf := make([]byte, 1024)
+
+	buf := make([]byte, 1024)
 	n, err := conn.Read(buf)
 	if err != nil {
 		t.Fatalf("Read failed: %v", err)

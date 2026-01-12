@@ -6,6 +6,7 @@ require (
 	github.com/cloudwego/netpoll v0.7.2
 	github.com/gobwas/ws v1.4.0
 	github.com/gorilla/websocket v1.5.3
+	github.com/klauspost/compress v1.18.2
 	github.com/valyala/fasthttp v1.69.0
 )
 

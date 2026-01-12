@@ -35,7 +35,7 @@ func getPayloadBuffer(size int) []byte {
 	if size <= 64*1024 {
 		return pool64k.Get().([]byte)[:size]
 	}
-	// Direct allocation for very large messages to avoid long-term retention
+	// Direct allocation for larger messages to avoid holding large chunks in memory
 	return make([]byte, size)
 }
 
@@ -54,4 +54,39 @@ func putPayloadBuffer(buf []byte) {
 	default:
 		// Do nothing for buffers that don't match our bucket sizes (let GC collect them)
 	}
+}
+
+// PooledWriter implements io.Writer using pooled buffers.
+type PooledWriter struct {
+	Buf []byte
+}
+
+func (p *PooledWriter) Write(data []byte) (int, error) {
+	required := len(p.Buf) + len(data)
+	if cap(p.Buf) < required {
+		// Grow
+		newCap := cap(p.Buf) * 2
+		if newCap < required {
+			newCap = required
+		}
+		// Upper limit check could be added here if needed, but for now we follow pool logic
+		newBuf := getPayloadBuffer(newCap)
+		copy(newBuf, p.Buf)
+
+		// Return old buffer if it was pooled
+		if cap(p.Buf) > 0 {
+			putPayloadBuffer(p.Buf)
+		}
+
+		p.Buf = newBuf[:len(p.Buf)]
+	}
+
+	currentLen := len(p.Buf)
+	p.Buf = p.Buf[:currentLen+len(data)]
+	copy(p.Buf[currentLen:], data)
+	return len(data), nil
+}
+
+func (p *PooledWriter) Bytes() []byte {
+	return p.Buf
 }

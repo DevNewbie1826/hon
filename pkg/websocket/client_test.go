@@ -17,7 +17,7 @@ type MockServerHandler struct {
 	DefaultHandler
 }
 
-func (h *MockServerHandler) OnMessage(c net.Conn, op ws.OpCode, payload []byte, fin bool) {
+func (h *MockServerHandler) OnMessage(c net.Conn, op ws.OpCode, payload []byte) {
 	// Echo back
 	wsutil.WriteServerMessage(c, op, payload)
 }
@@ -29,7 +29,7 @@ type MockClientHandler struct {
 	done      chan struct{}
 }
 
-func (h *MockClientHandler) OnMessage(c net.Conn, op ws.OpCode, payload []byte, fin bool) {
+func (h *MockClientHandler) OnMessage(c net.Conn, op ws.OpCode, payload []byte) {
 	h.recvCount++
 	if h.recvCount >= 1 {
 		close(h.done)

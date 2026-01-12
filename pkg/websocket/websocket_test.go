@@ -57,8 +57,8 @@ func (m *MockConn) SetWriteDeadline(t time.Time) error { return nil }
 // MockHijacker simulates Hon's response writer.
 type MockHijacker struct {
 	http.ResponseWriter
-	Conn *MockConn
-	RW   *bufio.ReadWriter
+	Conn        *MockConn
+	RW          *bufio.ReadWriter
 	ReadHandler adaptor.ReadHandler
 }
 
@@ -79,14 +79,16 @@ type MockHandler struct {
 	PingCnt    int32
 	PongCnt    int32
 	LastErr    error
+	LastMsg    []byte
 }
 
 func (h *MockHandler) OnOpen(c net.Conn) {
 	atomic.AddInt32(&h.OpenCnt, 1)
 }
 
-func (h *MockHandler) OnMessage(c net.Conn, op ws.OpCode, p []byte, fin bool) {
+func (h *MockHandler) OnMessage(c net.Conn, op ws.OpCode, payload []byte) {
 	atomic.AddInt32(&h.MessageCnt, 1)
+	h.LastMsg = append([]byte(nil), payload...)
 }
 
 func (h *MockHandler) OnClose(c net.Conn, err error) {
@@ -108,9 +110,9 @@ func TestUpgrade_Success(t *testing.T) {
 	mc := NewMockConn()
 	rw := bufio.NewReadWriter(bufio.NewReader(mc), bufio.NewWriter(mc))
 	mh := &MockHijacker{ResponseWriter: httptest.NewRecorder(), Conn: mc, RW: rw}
-	
+
 	handler := &MockHandler{}
-	
+
 	req := httptest.NewRequest("GET", "/ws", nil)
 	req.Header.Set("Connection", "Upgrade")
 	req.Header.Set("Upgrade", "websocket")
@@ -145,7 +147,7 @@ func TestOnCloseOnce(t *testing.T) {
 	req.Header.Set("Upgrade", "websocket")
 	req.Header.Set("Sec-WebSocket-Key", "key")
 	req.Header.Set("Sec-WebSocket-Version", "13")
-	
+
 	Upgrade(mh, req, handler)
 
 	// Simulate the reactor loop calling the handler
@@ -170,7 +172,7 @@ func TestOnClose_IsActive(t *testing.T) {
 	req.Header.Set("Upgrade", "websocket")
 	req.Header.Set("Sec-WebSocket-Key", "key")
 	req.Header.Set("Sec-WebSocket-Version", "13")
-	
+
 	Upgrade(mh, req, handler)
 
 	// Simulate loop
@@ -181,25 +183,27 @@ func TestOnClose_IsActive(t *testing.T) {
 	}
 }
 
-// TestStreamingLargePayload verifies that large payloads are chunked and don't error.
-func TestStreamingLargePayload(t *testing.T) {
+// TestReassemblyLargePayload verifies that large payloads are reassembled into a single message.
+func TestReassemblyLargePayload(t *testing.T) {
 	mc := NewMockConn()
 	// Create a large frame (e.g. 70KB) which is > default chunk size (64KB)
-	// This ensures OnMessage is called multiple times.
 	payloadSize := 70 * 1024
-	
+
 	// Write Header: Fin=1, Op=Text, Len=70KB (requires extended payload length 127)
 	mc.buf.WriteByte(0x81) // Fin | Text
 	mc.buf.WriteByte(127)  // Mask=0 | Len=127 (64-bit)
-	
+
 	// Write 64-bit length for 70KB
 	size := uint64(payloadSize)
 	for i := 56; i >= 0; i -= 8 {
 		mc.buf.WriteByte(byte(size >> i))
 	}
-	
+
 	// Write Payload
 	data := make([]byte, payloadSize)
+	// Fill with some data
+	data[0] = 'A'
+	data[len(data)-1] = 'Z'
 	mc.buf.Write(data)
 
 	rw := bufio.NewReadWriter(bufio.NewReader(mc), bufio.NewWriter(mc))
@@ -211,15 +215,22 @@ func TestStreamingLargePayload(t *testing.T) {
 	req.Header.Set("Upgrade", "websocket")
 	req.Header.Set("Sec-WebSocket-Key", "key")
 	req.Header.Set("Sec-WebSocket-Version", "13")
-	
+
 	Upgrade(mh, req, handler)
 
 	mh.ReadHandler(mc, rw)
 
-	// 70KB payload split into 64KB chunks -> ceil(70/64) = 2 chunks (64KB + 6KB)
-	expectedChunks := int32(2)
-	if atomic.LoadInt32(&handler.MessageCnt) != expectedChunks {
-		t.Errorf("OnMessage called %d times, expected %d", handler.MessageCnt, expectedChunks)
+	// In v0.6.0+, we expect 1 message (reassembled)
+	expectedMessages := int32(1)
+	if atomic.LoadInt32(&handler.MessageCnt) != expectedMessages {
+		t.Errorf("OnMessage called %d times, expected %d", handler.MessageCnt, expectedMessages)
+	}
+
+	if len(handler.LastMsg) != payloadSize {
+		t.Errorf("Payload size mismatch: got %d, want %d", len(handler.LastMsg), payloadSize)
+	}
+	if handler.LastMsg[0] != 'A' || handler.LastMsg[len(handler.LastMsg)-1] != 'Z' {
+		t.Errorf("Payload content corrupted")
 	}
 
 	// Connection closes normally after EOF
@@ -231,13 +242,13 @@ func TestStreamingLargePayload(t *testing.T) {
 // TestMultiplexing_PingPongData verifies interleaving control frames.
 func TestMultiplexing_PingPongData(t *testing.T) {
 	mc := NewMockConn()
-	
+
 	// 1. Text Frame "Hello"
 	ws.WriteFrame(mc.buf, ws.NewTextFrame([]byte("Hello")))
-	
+
 	// 2. Ping Frame
 	ws.WriteFrame(mc.buf, ws.NewPingFrame([]byte("ping")))
-	
+
 	// 3. Close Frame
 	ws.WriteFrame(mc.buf, ws.NewCloseFrame(ws.NewCloseFrameBody(ws.StatusNormalClosure, "")))
 
@@ -250,7 +261,7 @@ func TestMultiplexing_PingPongData(t *testing.T) {
 	req.Header.Set("Upgrade", "websocket")
 	req.Header.Set("Sec-WebSocket-Key", "key")
 	req.Header.Set("Sec-WebSocket-Version", "13")
-	
+
 	Upgrade(mh, req, handler)
 
 	mh.ReadHandler(mc, rw)
@@ -266,8 +277,8 @@ func TestMultiplexing_PingPongData(t *testing.T) {
 	}
 }
 
-// TestFragmentedMessages verifies handling of fragmented frames (Fin=0, then Fin=1).
-func TestFragmentedMessages(t *testing.T) {
+// TestReassemblyFragmentedMessages verifies handling of fragmented frames.
+func TestReassemblyFragmentedMessages(t *testing.T) {
 	mc := NewMockConn()
 
 	// Frame 1: Fin=0, Op=Text, Payload="Hello "
@@ -300,22 +311,23 @@ func TestFragmentedMessages(t *testing.T) {
 	req.Header.Set("Upgrade", "websocket")
 	req.Header.Set("Sec-WebSocket-Key", "key")
 	req.Header.Set("Sec-WebSocket-Version", "13")
-	
+
 	Upgrade(mh, req, handler)
 	mh.ReadHandler(mc, rw)
 
-	// Since our handler is streaming-based, it should just deliver chunks as they come.
-	// It doesn't reassemble frames automatically (that's the user's job or higher-level library).
-	// We expect 2 callbacks to OnMessage.
-	if atomic.LoadInt32(&handler.MessageCnt) != 2 {
-		t.Errorf("Expected 2 message chunks, got %d", handler.MessageCnt)
+	// v0.6.0: Expect 1 reassembled message
+	if atomic.LoadInt32(&handler.MessageCnt) != 1 {
+		t.Errorf("Expected 1 message, got %d", handler.MessageCnt)
+	}
+	if string(handler.LastMsg) != "Hello World" {
+		t.Errorf("Reassembly failed: got %q, want %q", string(handler.LastMsg), "Hello World")
 	}
 }
 
 // TestHandleError_ProtocolViolation checks error handling for large control frames.
 func TestHandleError_ControlFrameTooLarge(t *testing.T) {
 	mc := NewMockConn()
-	
+
 	// Create a Ping frame larger than 125 bytes (Protocol violation)
 	payload := make([]byte, 126)
 	// Manually write header because ws.NewPingFrame panics or limits size
@@ -335,7 +347,7 @@ func TestHandleError_ControlFrameTooLarge(t *testing.T) {
 	req.Header.Set("Upgrade", "websocket")
 	req.Header.Set("Sec-WebSocket-Key", "key")
 	req.Header.Set("Sec-WebSocket-Version", "13")
-	
+
 	Upgrade(mh, req, handler)
 	mh.ReadHandler(mc, rw)
 
@@ -352,11 +364,12 @@ func TestHandleError_ControlFrameTooLarge(t *testing.T) {
 // BenchmarkReadHeaderZeroAlloc verifies allocation behavior of our custom parser.
 // Expectation: 0 Allocs/op.
 func BenchmarkReadHeaderZeroAlloc(b *testing.B) {
+	// ... (Benchmark code)
 	// Prepare a buffer with a valid frame header (Ping)
 	// Fin=1, Op=Ping(9), Len=0
 	// 1000 1001 (0x89) | 0000 0000 (0x00)
 	raw := []byte{0x89, 0x00}
-	
+
 	// Pre-allocate reader
 	r := bytes.NewReader(raw)
 	br := bufio.NewReader(r)
@@ -371,5 +384,65 @@ func BenchmarkReadHeaderZeroAlloc(b *testing.B) {
 		if err != nil {
 			b.Fatal(err)
 		}
+	}
+}
+
+// TestDecompressionLimit_ZipBomb verifies that decompression respects MaxFrameSize.
+func TestDecompressionLimit_ZipBomb(t *testing.T) {
+	// Create a highly compressible payload (Zip Bomb like)
+	// 10MB of 'A's
+	hugePayload := bytes.Repeat([]byte{'A'}, 10*1024*1024)
+	compressed, err := CompressData(hugePayload)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Compressed size should be small
+	if len(compressed) > 100*1024 {
+		t.Fatalf("Compressed data too large: %d", len(compressed))
+	}
+
+	// Try to decompress with a small limit (e.g., 1KB)
+	limit := int64(1024)
+	out, err := DecompressData(compressed, limit)
+
+	// flate might error if stream is truncated by LimitReader, or might just finish.
+	// io.ReadAll(LimitReader) usually returns nil error.
+
+	// We expect the output to be capped at limit+1 (or exactly limit if logic changed)
+	// DecompressData uses LimitReader(fr, limit+1).
+
+	if int64(len(out)) > limit {
+		// This means we read more than limit, so protection worked (we stopped at limit+1)
+		// It confirms we detected the bomb.
+	} else if err != nil {
+		// Error is also fine (e.g. unexpected EOF)
+	} else {
+		// If we got full payload (10MB) without error, that's a fail.
+		if int64(len(out)) == int64(len(hugePayload)) {
+			t.Fatal("Zip Bomb exploded: full payload decompressed")
+		}
+	}
+
+	// In Assembler logic:
+	/*
+		decompressed, err := DecompressData(..., limit)
+		if limit > 0 && len(decompressed) > limit { error }
+	*/
+	// So DecompressData itself doesn't error on limit, it just returns up to limit+1.
+	// The test should verify that DecompressData stopped.
+
+	if int64(len(out)) > limit+100 { // Allow small margin but definitely not 10MB
+		t.Fatalf("DecompressData read too much: %d", len(out))
+	}
+}
+
+func TestCorruptCompressedData(t *testing.T) {
+	// Random junk
+	corrupt := []byte{0x01, 0x02, 0x03, 0x04}
+
+	_, err := DecompressData(corrupt, 1024)
+	if err == nil {
+		t.Fatal("Expected error for corrupt data")
 	}
 }
