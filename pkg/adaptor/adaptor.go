@@ -10,6 +10,7 @@ import (
 	"sync"
 	"sync/atomic"
 	"time"
+	"unsafe"
 
 	"github.com/DevNewbie1826/hon/pkg/appcontext"
 	"github.com/cloudwego/netpoll"
@@ -621,9 +622,13 @@ func (w *ResponseWriter) WriteString(s string) (int, error) {
 		if w.header.Get("Content-Type") == "" && len(s) > 0 {
 			// http.DetectContentType only needs the first 512 bytes
 			sniffLen := min(len(s), 512)
-			var buf [512]byte
-			copy(buf[:], s[:sniffLen])
-			w.header.Set("Content-Type", http.DetectContentType(buf[:sniffLen]))
+			// var buf [512]byte
+			// copy(buf[:], s[:sniffLen])
+
+			// Optimization: Zero-Alloc conversion
+			// http.DetectContentType reads the byte slice and does not retain it.
+			p := unsafe.Slice(unsafe.StringData(s), len(s))
+			w.header.Set("Content-Type", http.DetectContentType(p[:sniffLen]))
 		}
 		if err := w.ensureHeaderSent(); err != nil {
 			return 0, err

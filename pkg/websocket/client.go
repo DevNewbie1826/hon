@@ -92,7 +92,7 @@ func (c *Client) Dial(u string, handler Handler, opts ...Option) error {
 	handshakeDone := make(chan error, 1)
 	isHandshake := true
 
-	// --- [KEY FIX] Assembler is created once per connection and captured in closure ---
+	// Initialize Assembler once per connection to maintain state
 	assembler := NewAssembler(cfg)
 
 	err = conn.SetOnRequest(func(ctx context.Context, connection netpoll.Connection) error {

@@ -74,7 +74,9 @@ func (p *PooledWriter) Write(data []byte) (int, error) {
 		copy(newBuf, p.Buf)
 
 		// Return old buffer if it was pooled
-		if cap(p.Buf) > 0 {
+		// Only return if it matches our bucket sizes to avoid polluting pool with odd sizes
+		oldCap := cap(p.Buf)
+		if oldCap >= 512 && oldCap <= 64*1024 {
 			putPayloadBuffer(p.Buf)
 		}
 

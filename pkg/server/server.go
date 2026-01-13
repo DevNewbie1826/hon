@@ -113,36 +113,34 @@ func (s *Server) Serve(addr string) error {
 				conn.SetWriteTimeout(s.writeTimeout)
 			}
 
-			ctx, cancel := context.WithCancel(context.Background())
-
-			// Initialize ConnectionState and inject into context
-			// ConnectionState를 초기화하고 컨텍스트에 주입합니다.
-			// Use NewConnectionState to recycle objects from the pool.
-			state := engine.NewConnectionState(s.readTimeout, cancel)
-			ctx = context.WithValue(ctx, engine.CtxKeyConnectionState, state)
-
-			return ctx
+			// Optimization: Use ConnectionState as Context directly (Zero-Alloc)
+			// ConnectionState implements context.Context and manages its own cancellation.
+			state := engine.NewConnectionState(s.readTimeout)
+			return state
 		}),
 		netpoll.WithOnDisconnect(func(ctx context.Context, connection netpoll.Connection) {
 			// Decrement connection count
 			atomic.AddInt32(&s.connsCount, -1)
 
 			// Retrieve and release ConnectionState resources
-			// ConnectionState 리소스를 검색하고 해제합니다.
-			val := ctx.Value(engine.CtxKeyConnectionState)
-			if val == nil {
-				log.Printf("Warning: ConnectionState not found in context during disconnect")
-				return
-			}
-			state, ok := val.(*engine.ConnectionState)
+			// ConnectionState is the context itself
+			state, ok := ctx.(*engine.ConnectionState)
 			if !ok {
-				log.Printf("Warning: Invalid ConnectionState type in context during disconnect")
-				return
+				// Fallback if context was wrapped or something unexpected
+				val := ctx.Value(engine.CtxKeyConnectionState)
+				if val == nil {
+					log.Printf("Warning: ConnectionState not found in context during disconnect")
+					return
+				}
+				state, ok = val.(*engine.ConnectionState)
+				if !ok {
+					log.Printf("Warning: Invalid ConnectionState type in context during disconnect")
+					return
+				}
 			}
 
-			if state.CancelFunc != nil {
-				state.CancelFunc() // Cancels context on connection disconnect. // 연결이 끊어지면 컨텍스트를 취소합니다.
-			}
+			state.Cancel() // Cancels context on connection disconnect.
+
 			// Return buffers to the Engine's pool and state to global pool
 			s.Engine.ReleaseConnectionState(state)
 		}),

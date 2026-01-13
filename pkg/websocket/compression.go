@@ -144,5 +144,7 @@ func DecompressData(payload []byte, limit int64) ([]byte, error) {
 	// If the loop finished with a buffer potentially larger than needed, that's fine for the pool.
 	// usage: buf[:offset]
 
-	return buf[:offset], nil
+	// Resize the result slice to the actual data size
+	buf = buf[:offset]
+	return buf, nil
 }

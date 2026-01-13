@@ -12,6 +12,8 @@ type Handler interface {
 	OnOpen(c net.Conn)
 	// OnMessage is called when a complete message is received.
 	// Hon v0.6.0+ guarantees that payload is the full message (reassembled and decompressed).
+	// WARNING: 'payload' is reused from a pool. Do NOT retain it after this function returns.
+	// If you need to keep data, use copy(dest, payload).
 	OnMessage(c net.Conn, op ws.OpCode, payload []byte)
 
 	// OnClose is called when the connection is closed.

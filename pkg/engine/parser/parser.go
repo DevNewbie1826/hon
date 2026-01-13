@@ -19,11 +19,28 @@ type CheckResult struct {
 	Error         error
 }
 
+const MaxHeaderSize = 8 * 1024 // 8KB
+
 func CheckRequest(data []byte) CheckResult {
 	// 1. 헤더 경계 검색
 	headerEndIdx := bytes.Index(data, headerEnd)
 	if headerEndIdx == -1 {
+		// DoS Protection: If data exceeds limit and header end not found, reject.
+		if len(data) > MaxHeaderSize {
+			return CheckResult{
+				Complete: false,
+				Error:    strconv.ErrRange, // Or a custom error
+			}
+		}
 		return CheckResult{Complete: false}
+	}
+
+	// DoS Protection: If header is found but too large
+	if headerEndIdx > MaxHeaderSize {
+		return CheckResult{
+			Complete: false,
+			Error:    strconv.ErrRange,
+		}
 	}
 
 	headerBodySep := headerEndIdx + 4

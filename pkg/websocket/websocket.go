@@ -305,6 +305,10 @@ func ServeConn(c net.Conn, rw *bufio.ReadWriter, handler Handler, cfg *Config, a
 			_, err = io.ReadFull(rw.Reader, payload)
 		} else if isNetpoll {
 			// Real Zero-Copy: Use Netpoll buffer directly
+			// SAFETY: 'payload' is a slice of the internal Netpoll buffer.
+			// It is valid UNTIL the next call to nc.Reader().Next(), Skip(), or Read().
+			// Since we process the frame synchronously in processFrame() before loop continues, this is safe.
+			// WARNING to Maintainers: Do NOT make 'processFrame' async without copying 'payload'.
 			payload, err = nc.Reader().Next(int(h.Length))
 		}
 
@@ -373,6 +377,7 @@ func processFrame(c net.Conn, h ws.Header, payload []byte, handler Handler, asse
 		return err
 	}
 	if complete {
+		// SAFETY: 'fullPayload' is valid only during this call. User must copy if retaining.
 		handler.OnMessage(c, op, fullPayload)
 		// If isReassembled is true, fullPayload is from the pool and disjoint from 'payload'.
 		// We must return it to the pool.

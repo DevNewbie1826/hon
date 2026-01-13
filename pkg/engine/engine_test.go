@@ -2,7 +2,6 @@ package engine
 
 import (
 	"bytes"
-	"context"
 	"fmt"
 	"net"
 	"net/http"
@@ -79,10 +78,9 @@ func TestEngine_ServeConn_Basic(t *testing.T) {
 	conn.fillRequest("GET", "/", "")
 
 	// 3. Setup Context with ConnectionState (Required by ServeConn)
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
-	state := NewConnectionState(time.Second, cancel)
-	ctx = context.WithValue(ctx, CtxKeyConnectionState, state)
+	state := NewConnectionState(time.Second)
+	defer state.Cancel()
+	ctx := state
 
 	// 4. Call ServeConn
 	// Since ServeConn runs the handler synchronously in this design (except for the loop),
@@ -114,10 +112,9 @@ func TestEngine_ServeConn_PanicRecovery(t *testing.T) {
 	conn.fillRequest("GET", "/panic", "")
 
 	// 3. Setup Context
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
-	state := NewConnectionState(time.Second, cancel)
-	ctx = context.WithValue(ctx, CtxKeyConnectionState, state)
+	state := NewConnectionState(time.Second)
+	defer state.Cancel()
+	ctx := state
 
 	// 4. Call ServeConn
 	// It should recover from panic and NOT crash the test.
@@ -152,10 +149,9 @@ func TestEngine_ServeConn_KeepAlive(t *testing.T) {
 	conn.readBuf.WriteString("GET /?id=2 HTTP/1.1\r\nHost: localhost\r\n\r\n")
 
 	// 3. Setup Context
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
-	state := NewConnectionState(time.Second, cancel)
-	ctx = context.WithValue(ctx, CtxKeyConnectionState, state)
+	state := NewConnectionState(time.Second)
+	defer state.Cancel()
+	ctx := state
 
 	// 4. Call ServeConn
 	// It should loop and process both requests because buffer has data.
@@ -202,10 +198,9 @@ func TestEngine_MaxDrainSize(t *testing.T) {
 	conn.fillRequest("POST", "/", body)
 
 	// 3. Setup Context
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
-	state := NewConnectionState(time.Second, cancel)
-	ctx = context.WithValue(ctx, CtxKeyConnectionState, state)
+	state := NewConnectionState(time.Second)
+	defer state.Cancel()
+	ctx := state
 
 	// 4. Call ServeConn
 	err := eng.ServeConn(ctx, conn)
@@ -243,10 +238,9 @@ func TestEngine_RequestTimeout(t *testing.T) {
 	conn.fillRequest("GET", "/", "")
 
 	// 3. Setup Context
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
-	state := NewConnectionState(time.Second, cancel)
-	ctx = context.WithValue(ctx, CtxKeyConnectionState, state)
+	state := NewConnectionState(time.Second)
+	defer state.Cancel()
+	ctx := state
 
 	// 4. Call ServeConn
 	_ = eng.ServeConn(ctx, conn)

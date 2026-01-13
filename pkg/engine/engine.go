@@ -7,6 +7,7 @@ import (
 	"io"
 	"log"
 	"net/http"
+	"runtime"
 	"runtime/debug"
 	"strings"
 	"sync"
@@ -34,22 +35,64 @@ type ConnectionState struct {
 	CancelFunc  context.CancelFunc
 	ReadTimeout time.Duration
 	Processing  atomic.Bool
+	refCount    int32 // Reference count for safe resource release
+	done        chan struct{}
+	err         error
 }
 
-func NewConnectionState(readTimeout time.Duration, cancel context.CancelFunc) *ConnectionState {
+func NewConnectionState(readTimeout time.Duration) *ConnectionState {
 	s := connectionStatePool.Get().(*ConnectionState)
 	s.ReadTimeout = readTimeout
-	s.CancelFunc = cancel
+	s.refCount = 1 // Initial reference held by the connection (OnPrepare)
+	s.done = make(chan struct{})
+	s.err = nil
 	return s
 }
 
 func (s *ConnectionState) Reset() {
+	// Note: This method is only called when refCount reaches 0.
+	// At that point, no other goroutine should be accessing this state,
+	// so using non-atomic assignments is safe.
 	s.Reader = nil
 	s.Writer = nil
 	s.CancelFunc = nil
 	s.ReadHandler = nil
 	s.Processing.Store(false)
 	s.ReadTimeout = 0
+	s.refCount = 0
+	s.done = nil
+	s.err = nil
+}
+
+// Deadline implements context.Context
+func (s *ConnectionState) Deadline() (deadline time.Time, ok bool) {
+	return
+}
+
+// Done implements context.Context
+func (s *ConnectionState) Done() <-chan struct{} {
+	return s.done
+}
+
+// Err implements context.Context
+func (s *ConnectionState) Err() error {
+	return s.err
+}
+
+// Value implements context.Context
+func (s *ConnectionState) Value(key any) any {
+	if key == CtxKeyConnectionState {
+		return s
+	}
+	return nil
+}
+
+// Cancel closes the done channel, simulating context cancellation.
+func (s *ConnectionState) Cancel() {
+	if s.err == nil {
+		s.err = context.Canceled
+		close(s.done)
+	}
 }
 
 var CtxKeyConnectionState = struct{}{}
@@ -108,15 +151,26 @@ func NewEngine(handler http.Handler, opts ...Option) *Engine {
 	return e
 }
 
+// AcquireConnectionState increments the reference count.
+// Must be called when entering a goroutine that uses the state.
+func (e *Engine) AcquireConnectionState(s *ConnectionState) {
+	atomic.AddInt32(&s.refCount, 1)
+}
+
+// ReleaseConnectionState decrements the reference count.
+// If count reaches 0, resources are returned to the pool.
+// Must be called when leaving a goroutine that uses the state.
 func (e *Engine) ReleaseConnectionState(s *ConnectionState) {
-	if s.Reader != nil {
-		e.readerPool.Put(s.Reader)
+	if atomic.AddInt32(&s.refCount, -1) == 0 {
+		if s.Reader != nil {
+			e.readerPool.Put(s.Reader)
+		}
+		if s.Writer != nil {
+			e.writerPool.Put(s.Writer)
+		}
+		s.Reset()
+		connectionStatePool.Put(s)
 	}
-	if s.Writer != nil {
-		e.writerPool.Put(s.Writer)
-	}
-	s.Reset()
-	connectionStatePool.Put(s)
 }
 
 func (e *Engine) ServeConn(ctx context.Context, conn netpoll.Connection) error {
@@ -125,6 +179,18 @@ func (e *Engine) ServeConn(ctx context.Context, conn netpoll.Connection) error {
 		return errors.New("connection state not found")
 	}
 	state := stateVal.(*ConnectionState)
+
+	e.AcquireConnectionState(state)
+	defer e.ReleaseConnectionState(state)
+
+	// Top-Level Panic Recovery for this connection
+	defer func() {
+		if r := recover(); r != nil {
+			log.Printf("[Critical Panic] Recovered in ServeConn: %v\n%s", r, debug.Stack())
+			conn.Close()
+			// State will be released by the outer defer
+		}
+	}()
 
 	if !state.Processing.CompareAndSwap(false, true) {
 		return nil
@@ -173,6 +239,9 @@ func (e *Engine) serveHTTP(ctx context.Context, conn netpoll.Connection, state *
 	}()
 
 	for {
+		// Yield to other goroutines to prevent starvation under heavy load
+		runtime.Gosched()
+
 		if !conn.IsActive() {
 			state.Processing.Store(false)
 			return
