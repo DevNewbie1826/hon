@@ -4,103 +4,133 @@
 
 **Hon** (HTTP-over-Netpoll) is a high-performance HTTP engine adapter based on [CloudWeGo Netpoll](https://github.com/cloudwego/netpoll). It enables standard Go web frameworks (Gin, Chi, Echo) to handle massive concurrency using the **Reactor pattern** with zero code changes.
 
-## 🚀 Key Features
+---
 
-- **Extreme Concurrency**: Handle **25,000+ connections** with only **6 goroutines**.
-- **Resource Efficiency**: Maximizes CPU utilization by eliminating the Thread-per-Connection overhead.
-- **True Reactor Client**: Provides a WebSocket client that uses the same Reactor pattern, achieving **0 goroutines per connection**.
-- **Standard Compatibility**: Fully supports the `http.Handler` interface, allowing you to use existing routers like `chi`, `gin`, `echo`, `mux`, etc., without any code changes.
-- **Memory Management**: Utilizes Netpoll's high-performance memory cache (`mcache`) to minimize allocation/deallocation costs and ensure stable performance under heavy traffic.
-- **Zero-Allocation**: 
-  - **HTTP Parser**: Custom Zero-Alloc parser achieving **0 allocs/op** (Benchmark verified).
-  - **WebSocket**: Fully pooled assembly, compression, and masking.
-  - **Adaptor**: Stack-based sniffing for `Content-Type`, eliminating heap allocations.
+## 🚀 Why Hon?
 
-## 📊 Performance Benchmark (Hon vs Standard)
+Traditional Go servers (`net/http`) spawn one goroutine per connection. While Go's scheduler is amazing, maintaining 100,000+ goroutines consumes GBs of RAM and stresses the scheduler.
+
+**Hon** takes a different approach:
+- **Reactor Pattern**: Handles operations asynchronously and reuses goroutines from a pool (`gopool`).
+- **Zero-Allocation**: Highly optimized for throughput and minimal GC pressure.
+- **Zero-Code Integration**: Drop-in replacement for `http.ListenAndServe`.
+
+### ⚡ Key Features
+- **Extreme Concurrency**: Handled **25,000+ connections** with only **6 goroutines** in benchmarks.
+- **Resource Efficiency**: Maximizes CPU utilization by removing thread-per-conn overhead.
+- **True Reactor Client**: Includes a WebSocket client that also runs on the reactor, allowing **0 goroutines per connection**.
+- **Standard Compatibility**: Fully compatible with `http.Handler`. Use your favorite router (`chi`, `gin`, `echo`, `mux`).
+- **Safety First**: Built-in DoS protection (MaxHeaderSize) and Panic Recovery mechanism.
+
+---
+
+## 📦 Quick Start
+
+### 1. Install
+```bash
+go get github.com/DevNewbie1826/hon
+```
+
+### 2. Basic Usage (Zero Code Change)
+Just wrap your existing handler with `hon`.
+
+```go
+package main
+
+import (
+    "net/http"
+    "github.com/DevNewbie1826/hon/pkg/engine"
+    "github.com/DevNewbie1826/hon/pkg/server"
+)
+
+func main() {
+    // 1. Create your standard handler (Gin, Chi, Mux, or just ServeMux)
+    mux := http.NewServeMux()
+    mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
+        w.Write([]byte("Hello, Hon!"))
+    })
+
+    // 2. Wrap it with Hon Engine
+    eng := engine.NewEngine(mux)
+
+    // 3. Serve using Hon Server (instead of http.ListenAndServe)
+    server.NewServer(eng).Serve(":8080")
+}
+```
+
+---
+
+## 🛡️ Best Practices & Safety
+
+To get the most out of Hon, please follow these guidelines.
+
+### ✅ DO (Recommended)
+
+1.  **Use Context Properly**:
+    Hon implements `ConnectionState` as a `context.Context`. Use `r.Context()` to handle timeouts and cancellations correctly.
+    ```go
+    select {
+    case <-r.Context().Done():
+        return // Connection closed, stop processing
+    case <-time.After(time.Second):
+        // Work
+    }
+    ```
+
+2.  **Use the WebSocket Adaptor**:
+    For WebSockets, use `hon/pkg/adaptor` to upgrade connections. It seamlessly integrates with the reactor loop.
+
+### 🛑 DON'T (Anti-Patterns)
+
+1.  **Do NOT Block the Handler for too long**:
+    Hon uses a **Goroutine Pool** (`gopool`) to reuse goroutines. 
+    *   If you block the handler (e.g., long sleep, heavy DB wait), the pool cannot reuse that worker and **must spawn a new goroutine** to handle new requests.
+    *   This defeats the purpose of the Reactor pattern and leads to **Goroutine Explosion**, degrading performance to that of a standard server.
+    *   **Solution**: For potentially long-blocking tasks, wrap them in a separate goroutine or use efficient async APIs.
+
+2.  **Do NOT Retain WebSocket `payload` without Copying**:
+    > [!WARNING]
+    > **CRITICAL SAFETY NOTICE**
+    
+    The `payload` byte slice passed to `OnMessage` is a **Zero-Copy slice** pointing directly to the internal network buffer.
+    *   It is valid **ONLY** during the execution of the `OnMessage` function.
+    *   If you need to use the data **asynchronously** (e.g., in another goroutine, or storing it in a map), you **MUST** make a copy.
+
+    ```go
+    func (h *MyHandler) OnMessage(c net.Conn, op ws.OpCode, payload []byte, fin bool) {
+        // ✅ OK: Synchronous processing
+        fmt.Println(string(payload)) 
+        
+        // ❌ BAD: Retaining pointer (Data Corruption Risk!)
+        // globalStore = payload 
+
+        // ✅ OK: Making a copy for async/storage
+        dataCopy := make([]byte, len(payload))
+        copy(dataCopy, payload)
+        go processAsync(dataCopy)
+    }
+    ```
+
+---
+
+## 📊 Performance Benchmark
 
 Tested on macOS M4 (Local).
 
 ### 1. HTTP Throughput (RPS)
 | Mode | Requests/sec | Improvement |
 | :--- | :--- | :--- |
-| Standard (`net/http`) | 129,616 | - |
-| **Hon** | **233,404** | **+80%** |
+| Standard (`net/http`) | 129,370 | - |
+| **Hon** | **237,856** | **+83.8%** |
 
-> **Analysis**: 
-> - **Hon**: Outperforms the standard Go server by **80%** by utilizing the **Reactor pattern** and efficient memory pooling.
-
-### 2. Zero-Allocation Parser (Micro-Benchmark)
-| Component | Metric | Hon | Standard (`strconv`) |
-| :--- | :--- | :--- | :--- |
-| **Chunked Parsing** | **Allocations** | **0 allocs/op** | 1+ allocs/op |
-| **Content-Length** | **Allocations** | **0 allocs/op** | 0+ allocs/op |
-| **Parsing Speed** | **Time/Op** | **49.8 ns** | 71.7 ns |
-
-### 3. WebSocket Efficiency (15,000 Conns)
+### 2. WebSocket Efficiency (5,000 Conns)
 | Mode | Goroutines | Resource Usage |
 | :--- | :--- | :--- |
-| Standard (`gorilla`) | 15,005 | 100% (1 per conn) |
-| **Hon Server** | **6** | **0.04% (Reactor)** |
+| Standard (`gorilla`) | 5,006 | 100% (High memory) |
+| **Hon Server** | **7** | **0.1% (Extreme efficiency)** |
 
-### 4. Client Scalability (10,000 Conns)
-| Metric | Hon Client | Standard Client |
-| :--- | :--- | :--- |
-| **Goroutines** | **~4 (Total)** | 20,000+ |
-| **Connect Time** | **0.48s** | ~5.0s+ |
-| **Allocations** | **0 allocs/op** | High |
-
-> **Key Takeaway**: 
-> - **Hon Client**: Uses Netpoll's global poller to manage thousands of connections without spawning any goroutines per connection. Ideal for massive load testing or gateway services.
-
-## 📦 Quick Start
-
-```bash
-# 1. Install
-go get github.com/DevNewbie1826/hon
-
-# 2. Run Example
-go run cmd/example/main.go -type hon
-```
-
-## 💡 Usage Example
-
-### Server
-```go
-func main() {
-    mux := http.NewServeMux()
-    
-    // 1. Standard HTTP Handler (Compatible with Gin, Chi, Echo)
-    mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
-        w.Write([]byte("Hello, Hon!"))
-    })
-
-    // 2. Hon Optimized WebSocket
-    mux.HandleFunc("/ws", func(w http.ResponseWriter, r *http.Request) {
-        adaptor.Upgrade(w, r, &MyWSHandler{})
-    })
-
-    eng := engine.NewEngine(mux)
-    server.NewServer(eng).Serve(":1826")
-}
-
-type MyWSHandler struct { websocket.DefaultHandler }
-func (h *MyWSHandler) OnMessage(c net.Conn, op ws.OpCode, payload []byte, fin bool) {
-    // Event-driven callback without per-connection goroutine
-    wsutil.WriteServerMessage(c, op, payload)
-}
-```
-
-### Client
-```go
-// Connect to WebSocket Server
-// No goroutine is spawned for this connection!
-err := websocket.Dial("ws://localhost:1826/ws", &MyClientHandler{})
-
-type MyClientHandler struct { websocket.DefaultHandler }
-func (h *MyClientHandler) OnMessage(c net.Conn, op ws.OpCode, p []byte, fin bool) {
-    fmt.Printf("Received: %s\n", string(p))
-}
-```
+---
 
 ## 📄 License
+
 MIT License
