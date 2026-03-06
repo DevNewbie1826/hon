@@ -2,6 +2,7 @@ package server
 
 import (
 	"context"
+	"errors"
 	"net"
 	"net/http"
 	"sync/atomic"
@@ -216,5 +217,50 @@ func TestServer_ShutdownBeforeServe_PreventsLaterServe(t *testing.T) {
 	if err == nil {
 		_ = conn.Close()
 		t.Fatal("server should not start after Shutdown was already requested")
+	}
+}
+
+func TestServer_ConcurrentServeReturnsError(t *testing.T) {
+	mux := http.NewServeMux()
+	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+	})
+	srv := NewServer(engine.NewEngine(mux))
+
+	firstDone := make(chan error, 1)
+	go func() {
+		firstDone <- srv.Serve(":19995")
+	}()
+
+	select {
+	case <-srv.started:
+	case <-time.After(time.Second):
+		t.Fatal("first Serve did not start")
+	}
+
+	secondErr := make(chan error, 1)
+	go func() {
+		secondErr <- srv.Serve(":19994")
+	}()
+
+	select {
+	case err := <-secondErr:
+		if !errors.Is(err, ErrServerAlreadyServing) {
+			t.Fatalf("expected ErrServerAlreadyServing, got %v", err)
+		}
+	case <-time.After(200 * time.Millisecond):
+		t.Fatal("second Serve should fail fast while first Serve is active")
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	if err := srv.Shutdown(ctx); err != nil {
+		t.Fatalf("Shutdown failed: %v", err)
+	}
+
+	select {
+	case <-firstDone:
+	case <-time.After(time.Second):
+		t.Fatal("first Serve did not exit after Shutdown")
 	}
 }

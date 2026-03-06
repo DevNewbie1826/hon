@@ -188,3 +188,22 @@ func TestClientDial_AllowsDuplicateConnectionHeaders(t *testing.T) {
 		t.Fatal("timeout waiting for client message after handshake")
 	}
 }
+
+func TestValidateHandshakeResponse_Allocations(t *testing.T) {
+	secKey := "dGhlIHNhbXBsZSBub25jZQ=="
+	headerBlock := []byte(
+		"Upgrade: websocket\r\n" +
+			"Connection: keep-alive, Upgrade\r\n" +
+			fmt.Sprintf("Sec-WebSocket-Accept: %s\r\n", computeAcceptKey(secKey)),
+	)
+
+	allocs := testing.AllocsPerRun(1000, func() {
+		if err := validateHandshakeResponse(headerBlock, secKey); err != nil {
+			t.Fatalf("validateHandshakeResponse failed: %v", err)
+		}
+	})
+
+	if allocs > 1 {
+		t.Fatalf("expected at most 1 alloc per run, got %.2f", allocs)
+	}
+}

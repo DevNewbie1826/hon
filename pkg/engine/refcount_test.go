@@ -1,6 +1,7 @@
 package engine
 
 import (
+	"context"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -64,4 +65,28 @@ func TestRefCount_RaceCondition(t *testing.T) {
 
 	close(releaseWorker)
 	wg.Wait()
+}
+
+func TestConnectionState_Cancel_Concurrent_NoRace(t *testing.T) {
+	state := NewConnectionState(time.Second)
+
+	var wg sync.WaitGroup
+	for i := 0; i < 32; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			state.Cancel()
+		}()
+	}
+	wg.Wait()
+
+	if err := state.Err(); err != context.Canceled {
+		t.Fatalf("expected context.Canceled, got %v", err)
+	}
+
+	select {
+	case <-state.Done():
+	default:
+		t.Fatalf("expected done channel to be closed")
+	}
 }

@@ -37,14 +37,17 @@ type ConnectionState struct {
 	refCount    int32 // Reference count for safe resource release
 	done        chan struct{}
 	err         error
+	cancelMu    sync.RWMutex
 }
 
 func NewConnectionState(readTimeout time.Duration) *ConnectionState {
 	s := connectionStatePool.Get().(*ConnectionState)
+	s.cancelMu.Lock()
 	s.ReadTimeout = readTimeout
 	s.refCount = 1 // Initial reference held by the connection (OnPrepare)
 	s.done = make(chan struct{})
 	s.err = nil
+	s.cancelMu.Unlock()
 	return s
 }
 
@@ -52,6 +55,8 @@ func (s *ConnectionState) Reset() {
 	// Note: This method is only called when refCount reaches 0.
 	// At that point, no other goroutine should be accessing this state,
 	// so using non-atomic assignments is safe.
+	s.cancelMu.Lock()
+	defer s.cancelMu.Unlock()
 	s.Reader = nil
 	s.Writer = nil
 	s.CancelFunc = nil
@@ -70,11 +75,15 @@ func (s *ConnectionState) Deadline() (deadline time.Time, ok bool) {
 
 // Done implements context.Context
 func (s *ConnectionState) Done() <-chan struct{} {
+	s.cancelMu.RLock()
+	defer s.cancelMu.RUnlock()
 	return s.done
 }
 
 // Err implements context.Context
 func (s *ConnectionState) Err() error {
+	s.cancelMu.RLock()
+	defer s.cancelMu.RUnlock()
 	return s.err
 }
 
@@ -88,6 +97,8 @@ func (s *ConnectionState) Value(key any) any {
 
 // Cancel closes the done channel, simulating context cancellation.
 func (s *ConnectionState) Cancel() {
+	s.cancelMu.Lock()
+	defer s.cancelMu.Unlock()
 	if s.err == nil {
 		s.err = context.Canceled
 		close(s.done)

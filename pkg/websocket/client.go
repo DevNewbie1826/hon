@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"crypto/rand"
+	"crypto/sha1"
 	"encoding/base64"
 	"fmt"
 	"io"
@@ -18,6 +19,13 @@ import (
 )
 
 const maxHeaderSize = 4096 // 4KB for handshake header limit
+
+var (
+	headerConnectionBytes    = []byte(headerConnection)
+	headerUpgradeBytes       = []byte(headerUpgrade)
+	valWebsocketBytes        = []byte(valWebsocket)
+	secWebSocketAcceptHeader = []byte("Sec-WebSocket-Accept")
+)
 
 // Client manages WebSocket connections.
 type Client struct {
@@ -295,7 +303,7 @@ func buildHandshakeRequest(u *url.URL, cfg *Config) (handshakeRequest, error) {
 func validateHandshakeResponse(headerBlock []byte, secKey string) error {
 	var connectionOK bool
 	var upgradeOK bool
-	var acceptKey string
+	var acceptKeyOK bool
 
 	for len(headerBlock) > 0 {
 		lineEnd := bytes.Index(headerBlock, []byte("\r\n"))
@@ -320,12 +328,12 @@ func validateHandshakeResponse(headerBlock []byte, secKey string) error {
 		value := bytes.TrimSpace(line[colon+1:])
 
 		switch {
-		case bytes.EqualFold(key, []byte(headerConnection)):
-			connectionOK = connectionOK || headerHasTokenBytes(value, headerUpgrade)
-		case bytes.EqualFold(key, []byte(headerUpgrade)):
-			upgradeOK = upgradeOK || bytes.EqualFold(value, []byte(valWebsocket))
-		case bytes.EqualFold(key, []byte("Sec-WebSocket-Accept")):
-			acceptKey = string(value)
+		case bytes.EqualFold(key, headerConnectionBytes):
+			connectionOK = connectionOK || headerHasTokenBytes(value, headerUpgradeBytes)
+		case bytes.EqualFold(key, headerUpgradeBytes):
+			upgradeOK = upgradeOK || bytes.EqualFold(value, valWebsocketBytes)
+		case bytes.EqualFold(key, secWebSocketAcceptHeader):
+			acceptKeyOK = acceptKeyOK || acceptKeyMatches(value, secKey)
 		}
 	}
 
@@ -335,7 +343,7 @@ func validateHandshakeResponse(headerBlock []byte, secKey string) error {
 	if !upgradeOK {
 		return fmt.Errorf("handshake failed: invalid upgrade header")
 	}
-	if acceptKey != computeAcceptKey(secKey) {
+	if !acceptKeyOK {
 		return fmt.Errorf("handshake failed: invalid accept key")
 	}
 	return nil
@@ -350,7 +358,7 @@ func headerHasToken(v, token string) bool {
 	return false
 }
 
-func headerHasTokenBytes(v []byte, token string) bool {
+func headerHasTokenBytes(v []byte, token []byte) bool {
 	for len(v) > 0 {
 		comma := bytes.IndexByte(v, ',')
 		var part []byte
@@ -361,11 +369,43 @@ func headerHasTokenBytes(v []byte, token string) bool {
 			part = v[:comma]
 			v = v[comma+1:]
 		}
-		if bytes.EqualFold(bytes.TrimSpace(part), []byte(token)) {
+		if bytes.EqualFold(bytes.TrimSpace(part), token) {
 			return true
 		}
 	}
 	return false
+}
+
+func bytesEqualString(b []byte, s string) bool {
+	if len(b) != len(s) {
+		return false
+	}
+	for i := range b {
+		if b[i] != s[i] {
+			return false
+		}
+	}
+	return true
+}
+
+func acceptKeyMatches(value []byte, secKey string) bool {
+	if len(value) != 28 {
+		return false
+	}
+
+	totalLen := len(secKey) + len(magicGUID)
+	if totalLen > 128 {
+		return bytesEqualString(value, computeAcceptKey(secKey))
+	}
+
+	var keyBuf [128]byte
+	n := copy(keyBuf[:], secKey)
+	copy(keyBuf[n:], magicGUID)
+
+	sum := sha1.Sum(keyBuf[:totalLen])
+	var encoded [28]byte
+	base64.StdEncoding.Encode(encoded[:], sum[:])
+	return bytes.Equal(value, encoded[:])
 }
 
 func sendHandshake(conn netpoll.Connection, req string) error {

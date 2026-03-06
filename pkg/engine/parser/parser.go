@@ -5,6 +5,9 @@ import (
 	"strconv"
 )
 
+const maxInt = int(^uint(0) >> 1)
+const maxInt64 = int64(^uint64(0) >> 1)
+
 var (
 	headerEnd  = []byte("\r\n\r\n")
 	headerCL   = []byte("Content-Length:")
@@ -78,9 +81,14 @@ func CheckRequest(data []byte) CheckResult {
 			// Parse value: Trim spaces
 			val := line[len(headerCL):]
 			val = bytes.TrimSpace(val)
-			if cl, err := parseInt(val); err == nil {
-				contentLength = cl
+			cl, err := parseInt(val)
+			if err != nil {
+				return CheckResult{Complete: false, Error: err}
 			}
+			if cl < 0 {
+				return CheckResult{Complete: false, Error: strconv.ErrSyntax}
+			}
+			contentLength = cl
 			continue
 		}
 
@@ -138,24 +146,27 @@ func CheckRequest(data []byte) CheckResult {
 			offset += idx + 2
 
 			if chunkSize == 0 {
-				// Last chunk found. Now look for Trailer termination (Empty line)
-				// The trailer part ends with CRLF.
-				// Since we just consumed the CRLF after "0", we look for the next "\r\n".
-				// If there are no trailers, the next bytes should be "\r\n".
+				// Last chunk found. If there are no trailers, the next bytes are just CRLF.
+				if len(bodyData[offset:]) >= 2 && bytes.HasPrefix(bodyData[offset:], []byte("\r\n")) {
+					totalConsumed := headerBodySep + offset + 2
+					return CheckResult{Complete: true, BytesConsumed: totalConsumed}
+				}
 
-				trailerEnd := bytes.Index(bodyData[offset:], []byte("\r\n"))
+				// Otherwise, trailer section ends with CRLFCRLF.
+				trailerEnd := bytes.Index(bodyData[offset:], headerEnd)
 				if trailerEnd == -1 {
 					return CheckResult{Complete: false}
 				}
 
-				// Found the final CRLF.
-				totalConsumed := headerBodySep + offset + trailerEnd + 2
+				totalConsumed := headerBodySep + offset + trailerEnd + len(headerEnd)
 				return CheckResult{Complete: true, BytesConsumed: totalConsumed}
 			}
 
 			// Skip Chunk Data + CRLF
-			// Check if we have enough data
-			if len(bodyData[offset:]) < int(chunkSize)+2 {
+			if chunkSize > maxInt64-2 || chunkSize > int64(maxInt-2) {
+				return CheckResult{Complete: false, Error: strconv.ErrRange}
+			}
+			if int64(len(bodyData[offset:])) < chunkSize+2 {
 				return CheckResult{Complete: false}
 			}
 			offset += int(chunkSize) + 2
@@ -197,7 +208,11 @@ func parseInt(b []byte) (int, error) {
 		if ch < '0' || ch > '9' {
 			return 0, strconv.ErrSyntax
 		}
-		n = n*10 + int(ch-'0')
+		digit := int(ch - '0')
+		if n > (maxInt-digit)/10 {
+			return 0, strconv.ErrRange
+		}
+		n = n*10 + digit
 	}
 
 	if neg {
@@ -224,6 +239,9 @@ func parseHexInt(b []byte) (int64, error) {
 			val = int64(ch - 'A' + 10)
 		default:
 			return 0, strconv.ErrSyntax
+		}
+		if n > (maxInt64-val)/16 {
+			return 0, strconv.ErrRange
 		}
 		n = n*16 + val
 	}

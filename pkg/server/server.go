@@ -2,6 +2,7 @@ package server
 
 import (
 	"context"
+	"errors"
 	"log"
 	"sync"
 	"sync/atomic"
@@ -24,11 +25,14 @@ type Server struct {
 	connsCount        int32             // Current connection count.
 	mu                sync.RWMutex
 	shutdownRequested atomic.Bool
+	serving           atomic.Bool
 	started           chan struct{}
 	startedOnce       sync.Once
 	ready             chan struct{}
 	readyOnce         sync.Once
 }
+
+var ErrServerAlreadyServing = errors.New("server already serving")
 
 // Option is a function type for configuring the Server.
 // Option은 서버 설정을 위한 함수 타입입니다.
@@ -107,6 +111,10 @@ func (s *Server) Serve(addr string) error {
 		s.markReady()
 		return nil
 	}
+	if !s.serving.CompareAndSwap(false, true) {
+		return ErrServerAlreadyServing
+	}
+	defer s.serving.Store(false)
 
 	l, err := reuseport.Listen("tcp", addr)
 	if err != nil {
