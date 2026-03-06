@@ -308,9 +308,7 @@ func (w *ResponseWriter) WriteHeader(statusCode int) {
 var (
 	headerDate          = []byte("Date: ")    // HTTP Date header key and colon. // HTTP Date 헤더 키와 콜론입니다.
 	headerContentLength = "Content-Length"    // HTTP Content-Length header key. // HTTP Content-Length 헤더 키입니다.
-	headerContentType   = "Content-Type"      // HTTP Content-Type header key. // HTTP Content-Type 헤더 키입니다.
 	headerTransferEnc   = "Transfer-Encoding" // HTTP Transfer-Encoding header key. // HTTP Transfer-Encoding 헤더 키입니다.
-	headerConnection    = "Connection"        // HTTP Connection header key. // HTTP Connection 헤더 키입니다.
 
 	bytesTransferEncodingChunked         = []byte("Transfer-Encoding: chunked\r\n")           // Pre-computed bytes for chunked transfer encoding header.
 	bytesTransferEncodingChunkedTrailers = []byte("Transfer-Encoding: chunked, trailers\r\n") // Pre-computed bytes for chunked + trailers transfer encoding header.

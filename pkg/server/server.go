@@ -3,6 +3,7 @@ package server
 import (
 	"context"
 	"log"
+	"sync"
 	"sync/atomic"
 	"time"
 
@@ -14,13 +15,19 @@ import (
 // Server is the top-level structure for the netpoll server.
 // Server는 netpoll 서버의 최상위 구조체입니다.
 type Server struct {
-	Engine           *engine.Engine    // The request processing engine. // 요청 처리 엔진입니다.
-	eventLoop        netpoll.EventLoop // The netpoll event loop. // netpoll 이벤트 루프입니다.
-	keepAliveTimeout time.Duration     // Timeout for idle connections. // 유휴 연결에 대한 타임아웃입니다.
-	readTimeout      time.Duration     // Timeout for reading request data. // 요청 데이터 읽기에 대한 타임아웃입니다.
-	writeTimeout     time.Duration     // Timeout for writing response data. // 응답 데이터 쓰기에 대한 타임아웃입니다.
-	maxConns         int32             // Maximum concurrent connections.
-	connsCount       int32             // Current connection count.
+	Engine            *engine.Engine    // The request processing engine. // 요청 처리 엔진입니다.
+	eventLoop         netpoll.EventLoop // The netpoll event loop. // netpoll 이벤트 루프입니다.
+	keepAliveTimeout  time.Duration     // Timeout for idle connections. // 유휴 연결에 대한 타임아웃입니다.
+	readTimeout       time.Duration     // Timeout for reading request data. // 요청 데이터 읽기에 대한 타임아웃입니다.
+	writeTimeout      time.Duration     // Timeout for writing response data. // 응답 데이터 쓰기에 대한 타임아웃입니다.
+	maxConns          int32             // Maximum concurrent connections.
+	connsCount        int32             // Current connection count.
+	mu                sync.RWMutex
+	shutdownRequested atomic.Bool
+	started           chan struct{}
+	startedOnce       sync.Once
+	ready             chan struct{}
+	readyOnce         sync.Once
 }
 
 // Option is a function type for configuring the Server.
@@ -67,6 +74,8 @@ func NewServer(e *engine.Engine, opts ...Option) *Server {
 		readTimeout:      10 * time.Second,
 		writeTimeout:     10 * time.Second,
 		maxConns:         0, // Default: Unlimited
+		started:          make(chan struct{}),
+		ready:            make(chan struct{}),
 	}
 
 	for _, opt := range opts {
@@ -76,18 +85,38 @@ func NewServer(e *engine.Engine, opts ...Option) *Server {
 	return s
 }
 
+func (s *Server) markStarted() {
+	s.startedOnce.Do(func() {
+		close(s.started)
+	})
+}
+
+func (s *Server) markReady() {
+	s.readyOnce.Do(func() {
+		close(s.ready)
+	})
+}
+
 // Serve starts the netpoll event loop to handle incoming requests.
 // It uses SO_REUSEPORT for improved multi-process/thread binding performance.
 // Serve는 netpoll 이벤트 루프를 시작하여 들어오는 요청을 처리합니다.
 // SO_REUSEPORT를 사용하여 다중 프로세스/스레드 바인딩 성능을 향상시킵니다.
 func (s *Server) Serve(addr string) error {
+	s.markStarted()
+	if s.shutdownRequested.Load() {
+		s.markReady()
+		return nil
+	}
+
 	l, err := reuseport.Listen("tcp", addr)
 	if err != nil {
+		s.markReady()
 		return err
 	}
 
 	listener, err := netpoll.ConvertListener(l)
 	if err != nil {
+		s.markReady()
 		return err
 	}
 
@@ -150,9 +179,14 @@ func (s *Server) Serve(addr string) error {
 	// OnRequest 콜백은 Engine의 ServeConn 메서드를 호출합니다.
 	eventLoop, err := netpoll.NewEventLoop(s.Engine.ServeConn, opts...)
 	if err != nil {
+		s.markReady()
 		return err
 	}
+
+	s.mu.Lock()
 	s.eventLoop = eventLoop
+	s.mu.Unlock()
+	s.markReady()
 
 	return eventLoop.Serve(listener)
 }
@@ -160,8 +194,24 @@ func (s *Server) Serve(addr string) error {
 // Shutdown gracefully shuts down the server.
 // Shutdown은 서버를 정상적으로(gracefully) 종료합니다.
 func (s *Server) Shutdown(ctx context.Context) error {
-	if s.eventLoop == nil {
+	select {
+	case <-s.started:
+	default:
+		s.shutdownRequested.Store(true)
 		return nil
 	}
-	return s.eventLoop.Shutdown(ctx)
+
+	select {
+	case <-s.ready:
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+
+	s.mu.RLock()
+	eventLoop := s.eventLoop
+	s.mu.RUnlock()
+	if eventLoop == nil {
+		return nil
+	}
+	return eventLoop.Shutdown(ctx)
 }

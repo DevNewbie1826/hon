@@ -4,7 +4,7 @@ import (
 	"bufio"
 	"fmt"
 	"net"
-	"net/http"
+	"strings"
 	"testing"
 	"time"
 
@@ -36,31 +36,16 @@ func (h *MockClientHandler) OnMessage(c net.Conn, op ws.OpCode, payload []byte) 
 	}
 }
 
-func TestClientDial(t *testing.T) {
-	// 1. Start Server
-	http.HandleFunc("/ws_test", func(w http.ResponseWriter, r *http.Request) {
-		err := Upgrade(w, r, &MockServerHandler{})
-		if err != nil {
-			// t.Logf("Upgrade failed: %v", err) // Standard http server might fail hijack type assertion if not using Hon Engine, but we can test logic partially?
-			// Wait, Upgrade requires adaptor.Hijacker.
-			// Standard net/http ResponseWriter doesn't implement it cleanly without the adaptor/engine.
-			// However, we can mock the Hijacker interface or use a real listener for the test.
-			// For this unit test, let's use a standard net listener and simulate the server side manually
-			// OR use the actual Hon stack if possible.
-			// Given dependencies, let's try to mock the server behavior using a raw TCP listener to avoid full stack complexity in unit test.
-		}
-	})
-
-	// Real Server approach using net.Listen to avoid circular dependencies with pkg/server if possible,
-	// but Upgrade relies on specific interfaces.
-	// Let's create a simple TCP Echo Server that mimics a WS Server for the Client to connect to.
+func startHandshakeServer(t *testing.T, handle func(request string, conn net.Conn)) string {
+	t.Helper()
 
 	ln, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer ln.Close()
-	addr := ln.Addr().String()
+	t.Cleanup(func() {
+		_ = ln.Close()
+	})
 
 	go func() {
 		conn, err := ln.Accept()
@@ -70,51 +55,136 @@ func TestClientDial(t *testing.T) {
 		defer conn.Close()
 
 		br := bufio.NewReader(conn)
-		// 1. Read HTTP Upgrade Request
+		var request strings.Builder
 		for {
 			line, _ := br.ReadString('\n')
+			request.WriteString(line)
 			if line == "\r\n" {
 				break
 			}
 		}
 
-		// 2. Send HTTP Upgrade Response
-		conn.Write([]byte("HTTP/1.1 101 Switching Protocols\r\n" +
-			"Upgrade: websocket\r\n" +
-			"Connection: Upgrade\r\n" +
-			"Sec-WebSocket-Accept: s3pPLMBiTxaQ9kYGzzhZRbK+xOo=\r\n\r\n"))
+		handle(request.String(), conn)
+	}()
 
-		// 3. Send a WS Message (Hello)
-		wsutil.WriteServerMessage(conn, ws.OpText, []byte("Hello Client"))
+	return ln.Addr().String()
+}
 
-		// 4. Read Loop (Keep alive)
+func headerValue(request, key string) string {
+	prefix := key + ":"
+	for _, line := range strings.Split(request, "\r\n") {
+		if strings.HasPrefix(strings.ToLower(line), strings.ToLower(prefix)) {
+			return strings.TrimSpace(line[len(prefix):])
+		}
+	}
+	return ""
+}
+
+func validHandshakeResponse(request string) string {
+	return "HTTP/1.1 101 Switching Protocols\r\n" +
+		"Upgrade: websocket\r\n" +
+		"Connection: Upgrade\r\n" +
+		"Sec-WebSocket-Accept: " + computeAcceptKey(headerValue(request, "Sec-WebSocket-Key")) + "\r\n\r\n"
+}
+
+func TestClientDial(t *testing.T) {
+	addr := startHandshakeServer(t, func(request string, conn net.Conn) {
+		_, _ = conn.Write([]byte(validHandshakeResponse(request)))
+		_ = wsutil.WriteServerMessage(conn, ws.OpText, []byte("Hello Client"))
 		for {
 			_, _, err := wsutil.ReadClientData(conn)
 			if err != nil {
 				return
 			}
 		}
-	}()
+	})
 
-	// 2. Run Client
 	done := make(chan struct{})
 	handler := &MockClientHandler{done: done}
 
 	url := fmt.Sprintf("ws://%s/ws_test", addr)
 
-	// Wait a bit for server to be ready
-	time.Sleep(100 * time.Millisecond)
-
-	err = Dial(url, handler)
+	err := Dial(url, handler)
 	if err != nil {
 		t.Fatalf("Dial failed: %v", err)
 	}
 
-	// 3. Wait for message reception
 	select {
 	case <-done:
-		// Success
 	case <-time.After(2 * time.Second):
 		t.Fatal("Timeout waiting for message")
+	}
+}
+
+func TestClientDial_RejectsInvalidAccept(t *testing.T) {
+	addr := startHandshakeServer(t, func(request string, conn net.Conn) {
+		_, _ = conn.Write([]byte("HTTP/1.1 101 Switching Protocols\r\n" +
+			"Upgrade: websocket\r\n" +
+			"Connection: Upgrade\r\n" +
+			"Sec-WebSocket-Accept: invalid\r\n\r\n"))
+	})
+
+	err := Dial(fmt.Sprintf("ws://%s/ws_test", addr), &MockClientHandler{done: make(chan struct{})})
+	if err == nil {
+		t.Fatal("expected invalid accept key to fail the handshake")
+	}
+}
+
+func TestClientDial_RejectsMissingUpgradeHeader(t *testing.T) {
+	addr := startHandshakeServer(t, func(request string, conn net.Conn) {
+		_, _ = conn.Write([]byte("HTTP/1.1 101 Switching Protocols\r\n" +
+			"Connection: Upgrade\r\n" +
+			"Sec-WebSocket-Accept: " + computeAcceptKey(headerValue(request, "Sec-WebSocket-Key")) + "\r\n\r\n"))
+	})
+
+	err := Dial(fmt.Sprintf("ws://%s/ws_test", addr), &MockClientHandler{done: make(chan struct{})})
+	if err == nil {
+		t.Fatal("expected missing upgrade header to fail the handshake")
+	}
+}
+
+func TestClientDial_PropagatesHandshakeHeaderTooLarge(t *testing.T) {
+	addr := startHandshakeServer(t, func(request string, conn net.Conn) {
+		_, _ = conn.Write([]byte("HTTP/1.1 101 Switching Protocols\r\n" + strings.Repeat("X-Test: aaaaaaaaaaaaaaaaaaaaaaaa\r\n", 200)))
+	})
+
+	client := NewClient()
+	client.DialTimeout = 100 * time.Millisecond
+
+	err := client.Dial(fmt.Sprintf("ws://%s/ws_test", addr), &MockClientHandler{done: make(chan struct{})})
+	if err == nil {
+		t.Fatal("expected oversized header to fail the handshake")
+	}
+	if !strings.Contains(err.Error(), "response header too large") {
+		t.Fatalf("expected oversized header error, got %v", err)
+	}
+}
+
+func TestClientDial_AllowsDuplicateConnectionHeaders(t *testing.T) {
+	addr := startHandshakeServer(t, func(request string, conn net.Conn) {
+		_, _ = conn.Write([]byte("HTTP/1.1 101 Switching Protocols\r\n" +
+			"Connection: Upgrade\r\n" +
+			"Connection: keep-alive\r\n" +
+			"Upgrade: websocket\r\n" +
+			"Sec-WebSocket-Accept: " + computeAcceptKey(headerValue(request, "Sec-WebSocket-Key")) + "\r\n\r\n"))
+		_ = wsutil.WriteServerMessage(conn, ws.OpText, []byte("Hello Client"))
+		for {
+			_, _, err := wsutil.ReadClientData(conn)
+			if err != nil {
+				return
+			}
+		}
+	})
+
+	done := make(chan struct{})
+	err := Dial(fmt.Sprintf("ws://%s/ws_test", addr), &MockClientHandler{done: done})
+	if err != nil {
+		t.Fatalf("expected duplicate Connection headers to be accepted, got %v", err)
+	}
+
+	select {
+	case <-done:
+	case <-time.After(2 * time.Second):
+		t.Fatal("timeout waiting for client message after handshake")
 	}
 }

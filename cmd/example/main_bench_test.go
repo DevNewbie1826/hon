@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"testing"
 	"time"
@@ -34,9 +35,38 @@ func setupBenchmarkMux() *http.ServeMux {
 	return mux
 }
 
+func reserveLoopbackAddr(tb testing.TB) string {
+	tb.Helper()
+
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		tb.Fatal(err)
+	}
+	addr := ln.Addr().String()
+	_ = ln.Close()
+	return addr
+}
+
+func waitForHTTPServer(tb testing.TB, url string) {
+	tb.Helper()
+
+	client := &http.Client{Timeout: 50 * time.Millisecond}
+	deadline := time.Now().Add(time.Second)
+	for time.Now().Before(deadline) {
+		resp, err := client.Get(url)
+		if err == nil {
+			_, _ = io.Copy(io.Discard, resp.Body)
+			_ = resp.Body.Close()
+			return
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	tb.Fatalf("server at %s did not become reachable", url)
+}
+
 func BenchmarkHon(b *testing.B) {
 	mux := setupBenchmarkMux()
-	addr := ":1827"
+	addr := reserveLoopbackAddr(b)
 	srv := newHonServer(mux, addr)
 
 	go func() {
@@ -44,8 +74,6 @@ func BenchmarkHon(b *testing.B) {
 			// log.Println(err)
 		}
 	}()
-	// Give server some time to start
-	time.Sleep(100 * time.Millisecond)
 
 	defer func() {
 		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
@@ -53,7 +81,8 @@ func BenchmarkHon(b *testing.B) {
 		srv.Shutdown(ctx)
 	}()
 
-	url := "http://127.0.0.1" + addr
+	url := "http://" + addr
+	waitForHTTPServer(b, url)
 
 	client := &http.Client{
 		Timeout: 2 * time.Second,
@@ -77,7 +106,7 @@ func BenchmarkHon(b *testing.B) {
 
 func BenchmarkStd(b *testing.B) {
 	mux := setupBenchmarkMux()
-	addr := ":1829"
+	addr := reserveLoopbackAddr(b)
 	srv := newStdServer(mux, addr)
 
 	go func() {
@@ -85,8 +114,6 @@ func BenchmarkStd(b *testing.B) {
 			// log.Println(err)
 		}
 	}()
-	// Give server some time to start
-	time.Sleep(100 * time.Millisecond)
 
 	defer func() {
 		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
@@ -94,7 +121,8 @@ func BenchmarkStd(b *testing.B) {
 		srv.Shutdown(ctx)
 	}()
 
-	url := "http://127.0.0.1" + addr
+	url := "http://" + addr
+	waitForHTTPServer(b, url)
 
 	client := &http.Client{
 		Timeout: 2 * time.Second,

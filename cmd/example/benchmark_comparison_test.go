@@ -15,6 +15,21 @@ import (
 	"github.com/gorilla/websocket"
 )
 
+func waitForWebSocketDial(tb testing.TB, url string) *websocket.Conn {
+	tb.Helper()
+
+	deadline := time.Now().Add(time.Second)
+	for time.Now().Before(deadline) {
+		conn, _, err := websocket.DefaultDialer.Dial(url, nil)
+		if err == nil {
+			return conn
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	tb.Fatalf("websocket server at %s did not become reachable", url)
+	return nil
+}
+
 // --- Benchmarks ---
 
 func getBenchmarkClient() *http.Client {
@@ -122,10 +137,9 @@ func BenchmarkServer_Hon_HTTP(b *testing.B) {
 	}()
 	defer srv.Shutdown(context.Background())
 
-	time.Sleep(200 * time.Millisecond) // Give Hon time to re-bind
-
 	client := getBenchmarkClient()
 	url := "http://" + addr + "/"
+	waitForHTTPServer(b, url)
 
 	b.ResetTimer()
 	b.ReportAllocs()
@@ -159,10 +173,7 @@ func BenchmarkServer_Standard_WS(b *testing.B) {
 	url := "ws://" + addr + "/ws"
 
 	// Single Connection Throughput Test
-	c, _, err := websocket.DefaultDialer.Dial(url, nil)
-	if err != nil {
-		b.Fatalf("Dial failed: %v", err)
-	}
+	c := waitForWebSocketDial(b, url)
 	defer c.Close()
 
 	msg := []byte("Hello Benchmark")
@@ -200,14 +211,9 @@ func BenchmarkServer_Hon_WS(b *testing.B) {
 	}()
 	defer srv.Shutdown(context.Background())
 
-	time.Sleep(200 * time.Millisecond)
-
 	url := "ws://" + addr + "/ws"
 
-	c, _, err := websocket.DefaultDialer.Dial(url, nil)
-	if err != nil {
-		b.Fatalf("Dial failed (Hon): %v", err)
-	}
+	c := waitForWebSocketDial(b, url)
 	defer c.Close()
 
 	msg := []byte("Hello Benchmark")

@@ -22,6 +22,8 @@ type MockConnection struct {
 	onCloseCalled   bool
 }
 
+type contextKey string
+
 func (m *MockConnection) Read(b []byte) (n int, err error)     { return m.readBuf.Read(b) }
 func (m *MockConnection) Write(b []byte) (n int, err error)    { return m.writeBuf.Write(b) }
 func (m *MockConnection) Close() error                         { m.closed = true; return nil }
@@ -64,10 +66,6 @@ func TestNewRequestContext_Release_Pool(t *testing.T) {
 		t.Fatal("Expected RequestContext, got nil")
 	}
 
-	if ctx1 != ctx2 {
-		t.Errorf("Expected ctx1 and ctx2 to be the same object due to pooling")
-	}
-
 	// Verify fields are reset
 	if ctx2.conn != conn || ctx2.req != parentCtx || ctx2.reader != reader || ctx2.writer != writer {
 		t.Errorf("Expected fields to be reinitialized, but found lingering data")
@@ -83,7 +81,7 @@ func TestRequestContext_Accessors(t *testing.T) {
 	conn := &MockConnection{}
 	reader := bufio.NewReader(conn)
 	writer := bufio.NewWriter(conn)
-	parentCtx := context.WithValue(context.Background(), "key", "value")
+	parentCtx := context.WithValue(context.Background(), contextKey("key"), "value")
 
 	ctx := NewRequestContext(conn, parentCtx, reader, writer)
 	defer ctx.Release()

@@ -14,6 +14,45 @@ import (
 	"github.com/gobwas/ws/wsutil"
 )
 
+func reserveLoopbackAddr(t *testing.T) string {
+	t.Helper()
+
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	addr := ln.Addr().String()
+	_ = ln.Close()
+	return addr
+}
+
+func waitForTCPServer(t *testing.T, addr string) {
+	t.Helper()
+
+	deadline := time.Now().Add(time.Second)
+	for time.Now().Before(deadline) {
+		conn, err := net.DialTimeout("tcp", addr, 50*time.Millisecond)
+		if err == nil {
+			_ = conn.Close()
+			return
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	t.Fatalf("server at %s did not become reachable", addr)
+}
+
+func waitForConn(t *testing.T, ch <-chan net.Conn) net.Conn {
+	t.Helper()
+
+	select {
+	case conn := <-ch:
+		return conn
+	case <-time.After(time.Second):
+		t.Fatal("client connection not established")
+		return nil
+	}
+}
+
 func TestWebSocketIntegration(t *testing.T) {
 	// 1. Start Server
 	mux := http.NewServeMux()
@@ -29,19 +68,18 @@ func TestWebSocketIntegration(t *testing.T) {
 	eng := engine.NewEngine(mux)
 	srv := server.NewServer(eng)
 
-	// Use a fresh port
-	addr := "127.0.0.1:18267"
+	addr := reserveLoopbackAddr(t)
 
 	go srv.Serve(addr)
-	time.Sleep(200 * time.Millisecond)
+	waitForTCPServer(t, addr)
 
 	// 2. Client Setup
 	received := make(chan string, 1)
-	var clientConn net.Conn
+	opened := make(chan net.Conn, 1)
 
 	err := Dial("ws://"+addr+"/ws", &DefaultHandler{
 		OnOpenFunc: func(c net.Conn) {
-			clientConn = c
+			opened <- c
 		},
 		OnMessageFunc: func(c net.Conn, op ws.OpCode, p []byte) {
 			received <- string(p)
@@ -51,11 +89,7 @@ func TestWebSocketIntegration(t *testing.T) {
 		t.Fatalf("Dial failed: %v", err)
 	}
 
-	// Wait for reactor to call OnOpen
-	time.Sleep(200 * time.Millisecond)
-	if clientConn == nil {
-		t.Fatal("Client connection not established")
-	}
+	clientConn := waitForConn(t, opened)
 
 	// 3. Test Bidirectional Communication
 	messages := []string{"Hello", "Hon", "Reactor", "World"}
@@ -78,12 +112,7 @@ func TestWebSocketIntegration(t *testing.T) {
 }
 
 func TestWebSocket_CustomHeadersAndCookies(t *testing.T) {
-	ln, err := net.Listen("tcp", "127.0.0.1:0")
-	if err != nil {
-		t.Fatal(err)
-	}
-	addr := ln.Addr().String()
-	ln.Close() // Release port so Serve can bind to it
+	addr := reserveLoopbackAddr(t)
 
 	mux := http.NewServeMux()
 	mux.HandleFunc("/ws", func(w http.ResponseWriter, r *http.Request) {
@@ -108,11 +137,11 @@ func TestWebSocket_CustomHeadersAndCookies(t *testing.T) {
 
 	srv := server.NewServer(engine.NewEngine(mux))
 	go srv.Serve(addr) // Use the random port
-	time.Sleep(200 * time.Millisecond)
+	waitForTCPServer(t, addr)
 	defer srv.Shutdown(context.Background())
 
 	// Client with custom header and cookie
-	err = Dial("ws://"+addr+"/ws", &DefaultHandler{},
+	err := Dial("ws://"+addr+"/ws", &DefaultHandler{},
 		WithHeader("X-Custom-Auth", "secret-token"),
 		WithCookie(&http.Cookie{Name: "session_id", Value: "12345"}),
 	)
@@ -123,12 +152,7 @@ func TestWebSocket_CustomHeadersAndCookies(t *testing.T) {
 
 func TestWebSocket_Compression(t *testing.T) {
 	// Random Port
-	ln, err := net.Listen("tcp", "127.0.0.1:0")
-	if err != nil {
-		t.Fatal(err)
-	}
-	addr := ln.Addr().String()
-	ln.Close()
+	addr := reserveLoopbackAddr(t)
 
 	// 1. Server with Compression Enabled
 	mux := http.NewServeMux()
@@ -146,18 +170,18 @@ func TestWebSocket_Compression(t *testing.T) {
 
 	srv := server.NewServer(engine.NewEngine(mux))
 	go srv.Serve(addr)
-	time.Sleep(200 * time.Millisecond)
+	waitForTCPServer(t, addr)
 	defer srv.Shutdown(context.Background())
 
 	// 2. Client with Compression Enabled
 	received := make(chan string, 1)
-	var clientConn net.Conn
+	opened := make(chan net.Conn, 1)
 
 	cfg := &Config{EnableCompression: true}
 
-	err = Dial("ws://"+addr+"/ws", &DefaultHandler{
+	err := Dial("ws://"+addr+"/ws", &DefaultHandler{
 		OnOpenFunc: func(c net.Conn) {
-			clientConn = c
+			opened <- c
 		},
 		OnMessageFunc: func(c net.Conn, op ws.OpCode, p []byte) {
 			received <- string(p)
@@ -168,10 +192,7 @@ func TestWebSocket_Compression(t *testing.T) {
 		t.Fatalf("Dial failed: %v", err)
 	}
 
-	time.Sleep(200 * time.Millisecond)
-	if clientConn == nil {
-		t.Fatal("Client connection failed")
-	}
+	clientConn := waitForConn(t, opened)
 
 	// 3. Send Large Message (> 1KB)
 	largeMsg := strings.Repeat("A", 2048) // 2KB

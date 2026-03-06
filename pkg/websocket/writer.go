@@ -2,20 +2,9 @@ package websocket
 
 import (
 	"crypto/rand"
-	"io"
-	"net"
-
-	"github.com/cloudwego/netpoll"
 	"github.com/gobwas/ws"
+	"net"
 )
-
-type netpollWriterAdapter struct {
-	w netpoll.Writer
-}
-
-func (a netpollWriterAdapter) Write(p []byte) (n int, err error) {
-	return a.w.WriteBinary(p)
-}
 
 func WriteMessage(c net.Conn, op ws.OpCode, payload []byte, cfg *Config) error {
 	return writeMessageInternal(c, op, payload, cfg, false)
@@ -95,8 +84,4 @@ func writeMessageInternal(c net.Conn, op ws.OpCode, payload []byte, cfg *Config,
 		return err
 	}
 	return nil
-}
-
-type appender interface {
-	io.Writer
 }

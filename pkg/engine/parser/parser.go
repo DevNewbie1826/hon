@@ -10,7 +10,6 @@ var (
 	headerCL   = []byte("Content-Length:")
 	headerTE   = []byte("Transfer-Encoding:")
 	valChunked = []byte("chunked")
-	chunkEnd   = []byte("0\r\n\r\n")
 )
 
 type CheckResult struct {

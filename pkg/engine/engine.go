@@ -7,7 +7,6 @@ import (
 	"io"
 	"log"
 	"net/http"
-	"runtime"
 	"runtime/debug"
 	"strings"
 	"sync"
@@ -239,9 +238,6 @@ func (e *Engine) serveHTTP(ctx context.Context, conn netpoll.Connection, state *
 	}()
 
 	for {
-		// Yield to other goroutines to prevent starvation under heavy load
-		runtime.Gosched()
-
 		if !conn.IsActive() {
 			state.Processing.Store(false)
 			return
@@ -251,12 +247,29 @@ func (e *Engine) serveHTTP(ctx context.Context, conn netpoll.Connection, state *
 		if state.Reader.Buffered() == 0 {
 			r := conn.Reader()
 			if r != nil {
-				if r.Len() == 0 {
+				available := r.Len()
+				if available == 0 {
 					state.Processing.Store(false)
 					return
 				}
-				peekBuf, _ := r.Peek(r.Len())
-				if !parser.CheckRequest(peekBuf).Complete {
+
+				peekLen := available
+				if peekLen > 64 {
+					peekLen = 64
+				}
+
+				peekBuf, _ := r.Peek(peekLen)
+				check := parser.CheckRequest(peekBuf)
+				if !check.Complete && check.Error == nil && peekLen < available {
+					peekBuf, _ = r.Peek(available)
+					check = parser.CheckRequest(peekBuf)
+				}
+				if check.Error != nil {
+					conn.Close()
+					state.Processing.Store(false)
+					return
+				}
+				if !check.Complete {
 					state.Processing.Store(false)
 					return
 				}

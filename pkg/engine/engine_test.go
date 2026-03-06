@@ -9,6 +9,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/DevNewbie1826/hon/pkg/engine/parser"
 	"github.com/cloudwego/netpoll"
 )
 
@@ -18,6 +19,92 @@ type MockConnection struct {
 	readBuf  bytes.Buffer
 	writeBuf bytes.Buffer
 	closed   bool
+	reader   netpoll.Reader
+}
+
+type mockNetpollReader struct {
+	data   []byte
+	offset int
+}
+
+func newMockNetpollReader(data []byte) *mockNetpollReader {
+	return &mockNetpollReader{data: append([]byte(nil), data...)}
+}
+
+func (r *mockNetpollReader) remaining() []byte {
+	if r.offset >= len(r.data) {
+		return nil
+	}
+	return r.data[r.offset:]
+}
+
+func (r *mockNetpollReader) Next(n int) ([]byte, error) {
+	buf, err := r.Peek(n)
+	if err != nil {
+		return nil, err
+	}
+	r.offset += n
+	return buf, nil
+}
+
+func (r *mockNetpollReader) Peek(n int) ([]byte, error) {
+	remaining := r.remaining()
+	if len(remaining) < n {
+		return nil, net.ErrClosed
+	}
+	return remaining[:n], nil
+}
+
+func (r *mockNetpollReader) Skip(n int) error {
+	if len(r.remaining()) < n {
+		return net.ErrClosed
+	}
+	r.offset += n
+	return nil
+}
+
+func (r *mockNetpollReader) Until(delim byte) ([]byte, error) {
+	remaining := r.remaining()
+	idx := bytes.IndexByte(remaining, delim)
+	if idx == -1 {
+		return remaining, net.ErrClosed
+	}
+	return r.Next(idx + 1)
+}
+
+func (r *mockNetpollReader) ReadString(n int) (string, error) {
+	buf, err := r.Next(n)
+	return string(buf), err
+}
+
+func (r *mockNetpollReader) ReadBinary(n int) ([]byte, error) {
+	buf, err := r.Next(n)
+	if err != nil {
+		return nil, err
+	}
+	return append([]byte(nil), buf...), nil
+}
+
+func (r *mockNetpollReader) ReadByte() (byte, error) {
+	buf, err := r.Next(1)
+	if err != nil {
+		return 0, err
+	}
+	return buf[0], nil
+}
+
+func (r *mockNetpollReader) Slice(n int) (netpoll.Reader, error) {
+	buf, err := r.Next(n)
+	if err != nil {
+		return nil, err
+	}
+	return newMockNetpollReader(buf), nil
+}
+
+func (r *mockNetpollReader) Release() error { return nil }
+
+func (r *mockNetpollReader) Len() int {
+	return len(r.remaining())
 }
 
 func (m *MockConnection) Read(b []byte) (n int, err error) {
@@ -46,11 +133,7 @@ func (m *MockConnection) RemoteAddr() net.Addr {
 
 // Reader returns a valid reader so conn.Reader().Len() checks works in ServeConn double-check lock
 func (m *MockConnection) Reader() netpoll.Reader {
-	// For simplicity in this mock, we can return nil or a dummy.
-	// The engine checks `if r := conn.Reader(); r != nil && r.Len() > 0`.
-	// If we want to test the double-check lock, we need a real implementation,
-	// but for basic tests, nil is fine as long as we don't rely on that specific path.
-	return nil
+	return m.reader
 }
 
 // fillRequest writes a simple HTTP request to the read buffer
@@ -253,6 +336,60 @@ func TestEngine_RequestTimeout(t *testing.T) {
 		}
 	case <-time.After(1 * time.Second):
 		t.Error("Test timed out waiting for handler")
+	}
+}
+
+func TestEngine_ServeConn_ClosesOversizedHeader(t *testing.T) {
+	called := false
+	eng := NewEngine(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		called = true
+	}))
+
+	conn := &MockConnection{}
+	oversized := bytes.Repeat([]byte("X"), parser.MaxHeaderSize+1)
+	conn.reader = newMockNetpollReader(oversized)
+
+	state := NewConnectionState(time.Second)
+	defer state.Cancel()
+
+	if err := eng.ServeConn(state, conn); err != nil {
+		t.Fatalf("ServeConn failed: %v", err)
+	}
+
+	if !conn.closed {
+		t.Fatal("expected connection to close on parser error")
+	}
+	if called {
+		t.Fatal("handler should not be called when parser rejects the request")
+	}
+}
+
+func TestEngine_ServeConn_WaitsForPartialRequest(t *testing.T) {
+	called := false
+	eng := NewEngine(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		called = true
+	}))
+
+	partial := []byte("GET / HTTP/1.1\r\nHost: local")
+	conn := &MockConnection{}
+	conn.readBuf.Write(partial)
+	conn.reader = newMockNetpollReader(partial)
+
+	state := NewConnectionState(time.Second)
+	defer state.Cancel()
+
+	if err := eng.ServeConn(state, conn); err != nil {
+		t.Fatalf("ServeConn failed: %v", err)
+	}
+
+	if conn.closed {
+		t.Fatal("connection should remain open for partial requests")
+	}
+	if called {
+		t.Fatal("handler should not run until the request is complete")
+	}
+	if got := conn.writeBuf.Len(); got != 0 {
+		t.Fatalf("expected no response for partial request, got %d bytes", got)
 	}
 }
 

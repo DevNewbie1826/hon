@@ -132,6 +132,32 @@ func TestUpgrade_Success(t *testing.T) {
 	}
 }
 
+func TestUpgrade_AllowsConnectionTokenList(t *testing.T) {
+	mc := NewMockConn()
+	rw := bufio.NewReadWriter(bufio.NewReader(mc), bufio.NewWriter(mc))
+	mh := &MockHijacker{ResponseWriter: httptest.NewRecorder(), Conn: mc, RW: rw}
+
+	handler := &MockHandler{}
+
+	req := httptest.NewRequest("GET", "/ws", nil)
+	req.Header.Set("Connection", "keep-alive, Upgrade")
+	req.Header.Set("Upgrade", "websocket")
+	req.Header.Set("Sec-WebSocket-Key", "dGhlIHNhbXBsZSBub25jZQ==")
+	req.Header.Set("Sec-WebSocket-Version", "13")
+
+	err := Upgrade(mh, req, handler)
+	if err != nil {
+		t.Fatalf("Upgrade failed: %v", err)
+	}
+
+	if atomic.LoadInt32(&handler.OpenCnt) != 1 {
+		t.Errorf("OnOpen not called")
+	}
+	if mh.ReadHandler == nil {
+		t.Errorf("ReadHandler not set")
+	}
+}
+
 // TestOnCloseOnce verifies that OnClose is called exactly once when a Close frame is received.
 func TestOnCloseOnce(t *testing.T) {
 	mc := NewMockConn()

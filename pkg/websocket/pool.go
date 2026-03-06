@@ -15,25 +15,25 @@ import (
 //  Everything > 64KB is allocated directly to avoid holding large chunks in memory.
 
 var (
-	pool512b = sync.Pool{New: func() any { return make([]byte, 512) }}
-	pool4k   = sync.Pool{New: func() any { return make([]byte, 4096) }}
-	pool16k  = sync.Pool{New: func() any { return make([]byte, 16*1024) }}
-	pool64k  = sync.Pool{New: func() any { return make([]byte, 64*1024) }}
+	pool512b = sync.Pool{New: func() any { return new([512]byte) }}
+	pool4k   = sync.Pool{New: func() any { return new([4096]byte) }}
+	pool16k  = sync.Pool{New: func() any { return new([16 * 1024]byte) }}
+	pool64k  = sync.Pool{New: func() any { return new([64 * 1024]byte) }}
 )
 
 // getPayloadBuffer returns a byte slice of at least 'size' capacity.
 func getPayloadBuffer(size int) []byte {
 	if size <= 512 {
-		return pool512b.Get().([]byte)[:size]
+		return pool512b.Get().(*[512]byte)[:size]
 	}
 	if size <= 4096 {
-		return pool4k.Get().([]byte)[:size]
+		return pool4k.Get().(*[4096]byte)[:size]
 	}
 	if size <= 16*1024 {
-		return pool16k.Get().([]byte)[:size]
+		return pool16k.Get().(*[16 * 1024]byte)[:size]
 	}
 	if size <= 64*1024 {
-		return pool64k.Get().([]byte)[:size]
+		return pool64k.Get().(*[64 * 1024]byte)[:size]
 	}
 	// Direct allocation for larger messages to avoid holding large chunks in memory
 	return make([]byte, size)
@@ -44,13 +44,13 @@ func putPayloadBuffer(buf []byte) {
 	c := cap(buf)
 	switch c {
 	case 512:
-		pool512b.Put(buf)
+		pool512b.Put((*[512]byte)(buf[:512]))
 	case 4096:
-		pool4k.Put(buf)
+		pool4k.Put((*[4096]byte)(buf[:4096]))
 	case 16 * 1024:
-		pool16k.Put(buf)
+		pool16k.Put((*[16 * 1024]byte)(buf[:16*1024]))
 	case 64 * 1024:
-		pool64k.Put(buf)
+		pool64k.Put((*[64 * 1024]byte)(buf[:64*1024]))
 	default:
 		// Do nothing for buffers that don't match our bucket sizes (let GC collect them)
 	}

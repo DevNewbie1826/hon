@@ -170,8 +170,8 @@ func Upgrade(w http.ResponseWriter, r *http.Request, handler Handler, opts ...Op
 		return fmt.Errorf("websocket: method not allowed")
 	}
 
-	if !strings.EqualFold(r.Header.Get(headerConnection), headerUpgrade) ||
-		!strings.EqualFold(r.Header.Get(headerUpgrade), valWebsocket) {
+	if !headerHasToken(r.Header.Get(headerConnection), headerUpgrade) ||
+		!strings.EqualFold(strings.TrimSpace(r.Header.Get(headerUpgrade)), valWebsocket) {
 		return fmt.Errorf("websocket: invalid upgrade headers")
 	}
 

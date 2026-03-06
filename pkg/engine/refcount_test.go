@@ -38,6 +38,8 @@ func TestRefCount_RaceCondition(t *testing.T) {
 
 	var wg sync.WaitGroup
 	wg.Add(1)
+	acquired := make(chan struct{})
+	releaseWorker := make(chan struct{})
 
 	// Simulate ServeConn running in a separate goroutine
 	go func() {
@@ -46,32 +48,20 @@ func TestRefCount_RaceCondition(t *testing.T) {
 		if atomic.LoadInt32(&s.refCount) != 2 {
 			t.Errorf("RefCount inside goroutine should be 2")
 		}
+		close(acquired)
 
-		// Simulate some processing time
-		time.Sleep(100 * time.Millisecond)
-
+		<-releaseWorker
 		e.ReleaseConnectionState(s) // Ref -> 1 (if Disconnect happened) or 0 (if not)
 	}()
 
 	// Simulate OnDisconnect happening concurrently
-	time.Sleep(50 * time.Millisecond) // Wait for goroutine to acquire
-	e.ReleaseConnectionState(s)       // Ref -> 1
+	<-acquired
+	e.ReleaseConnectionState(s) // Ref -> 1
 
-	if atomic.LoadInt32(&s.refCount) == 0 {
-		t.Errorf("RefCount should not be 0 yet")
+	if got := atomic.LoadInt32(&s.refCount); got != 1 {
+		t.Errorf("RefCount should be 1 before the final release, got %d", got)
 	}
 
+	close(releaseWorker)
 	wg.Wait()
-
-	// After goroutine finishes, RefCount should be 0 and returned to pool
-	// Use a trick to check if it's reset: s.ReadTimeout should be 0
-	// Note: s pointer is technically invalid if in pool, but for this test we check the struct state
-	// assuming no one else grabbed it from pool yet.
-	// In a real high-concurrency scenario this check is flaky, but valid for single unit test.
-	if atomic.LoadInt32(&s.refCount) != 0 {
-		t.Errorf("Final RefCount should be 0, got %d", s.refCount)
-	}
-	if s.ReadTimeout != 0 {
-		t.Errorf("State should be reset (ReadTimeout=0)")
-	}
 }

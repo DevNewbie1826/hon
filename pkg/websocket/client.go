@@ -26,6 +26,11 @@ type Client struct {
 	wg sync.WaitGroup
 }
 
+type handshakeRequest struct {
+	raw    string
+	secKey string
+}
+
 // NewClient creates a new WebSocket Client.
 func NewClient() *Client {
 	return &Client{
@@ -64,6 +69,11 @@ func (c *Client) Dial(u string, handler Handler, opts ...Option) error {
 		opt(cfg)
 	}
 
+	req, err := buildHandshakeRequest(parsedURL, cfg)
+	if err != nil {
+		return err
+	}
+
 	// Track active connection
 	c.wg.Add(1)
 
@@ -91,6 +101,13 @@ func (c *Client) Dial(u string, handler Handler, opts ...Option) error {
 	// State Machine for Handshake
 	handshakeDone := make(chan error, 1)
 	isHandshake := true
+	reportHandshakeErr := func(err error) error {
+		select {
+		case handshakeDone <- err:
+		default:
+		}
+		return err
+	}
 
 	// Initialize Assembler once per connection to maintain state
 	assembler := NewAssembler(cfg)
@@ -106,19 +123,19 @@ func (c *Client) Dial(u string, handler Handler, opts ...Option) error {
 			peekLen := min(available, maxHeaderSize)
 			peekBuf, err := reader.Peek(peekLen)
 			if err != nil && err != netpoll.ErrEOF && err != io.EOF {
-				return err
+				return reportHandshakeErr(err)
 			}
 			idx := bytes.Index(peekBuf, []byte("\r\n\r\n"))
 			if idx == -1 {
 				if available > maxHeaderSize {
-					return fmt.Errorf("websocket: response header too large")
+					return reportHandshakeErr(fmt.Errorf("websocket: response header too large"))
 				}
 				return nil
 			}
 			headerBytes := idx + 4
-			headerStr := string(peekBuf[:idx])
-			lines := strings.Split(headerStr, "\r\n")
-			if len(lines) < 1 {
+			headerBlock := peekBuf[:idx]
+			statusLineEnd := bytes.Index(headerBlock, []byte("\r\n"))
+			if statusLineEnd == -1 {
 				err := fmt.Errorf("empty response")
 				select {
 				case handshakeDone <- err:
@@ -126,8 +143,16 @@ func (c *Client) Dial(u string, handler Handler, opts ...Option) error {
 				}
 				return nil
 			}
-			if !strings.HasPrefix(lines[0], "HTTP/1.1 101") {
-				err := fmt.Errorf("handshake failed: %s", lines[0])
+			statusLine := headerBlock[:statusLineEnd]
+			if !bytes.HasPrefix(statusLine, []byte("HTTP/1.1 101")) {
+				err := fmt.Errorf("handshake failed: %s", string(statusLine))
+				select {
+				case handshakeDone <- err:
+				default:
+				}
+				return nil
+			}
+			if err := validateHandshakeResponse(headerBlock[statusLineEnd+2:], req.secKey); err != nil {
 				select {
 				case handshakeDone <- err:
 				default:
@@ -160,7 +185,7 @@ func (c *Client) Dial(u string, handler Handler, opts ...Option) error {
 	}
 
 	// Send Handshake Request
-	if err := sendHandshake(conn, parsedURL, cfg); err != nil {
+	if err := sendHandshake(conn, req.raw); err != nil {
 		conn.Close()
 		c.wg.Done()
 		return err
@@ -202,10 +227,10 @@ func (h *clientCloseTracker) OnClose(c net.Conn, err error) {
 	})
 }
 
-func buildHandshakeRequest(u *url.URL, cfg *Config) (string, error) {
+func buildHandshakeRequest(u *url.URL, cfg *Config) (handshakeRequest, error) {
 	key := make([]byte, 16)
 	if _, err := rand.Read(key); err != nil {
-		return "", err
+		return handshakeRequest{}, err
 	}
 	secKey := base64.StdEncoding.EncodeToString(key)
 
@@ -261,14 +286,89 @@ func buildHandshakeRequest(u *url.URL, cfg *Config) (string, error) {
 	}
 
 	sb.WriteString("\r\n")
-	return sb.String(), nil
+	return handshakeRequest{
+		raw:    sb.String(),
+		secKey: secKey,
+	}, nil
 }
 
-func sendHandshake(conn netpoll.Connection, u *url.URL, cfg *Config) error {
-	req, err := buildHandshakeRequest(u, cfg)
-	if err != nil {
-		return err
+func validateHandshakeResponse(headerBlock []byte, secKey string) error {
+	var connectionOK bool
+	var upgradeOK bool
+	var acceptKey string
+
+	for len(headerBlock) > 0 {
+		lineEnd := bytes.Index(headerBlock, []byte("\r\n"))
+		var line []byte
+		if lineEnd == -1 {
+			line = headerBlock
+			headerBlock = nil
+		} else {
+			line = headerBlock[:lineEnd]
+			headerBlock = headerBlock[lineEnd+2:]
+		}
+		if len(line) == 0 {
+			continue
+		}
+
+		colon := bytes.IndexByte(line, ':')
+		if colon == -1 {
+			continue
+		}
+
+		key := bytes.TrimSpace(line[:colon])
+		value := bytes.TrimSpace(line[colon+1:])
+
+		switch {
+		case bytes.EqualFold(key, []byte(headerConnection)):
+			connectionOK = connectionOK || headerHasTokenBytes(value, headerUpgrade)
+		case bytes.EqualFold(key, []byte(headerUpgrade)):
+			upgradeOK = upgradeOK || bytes.EqualFold(value, []byte(valWebsocket))
+		case bytes.EqualFold(key, []byte("Sec-WebSocket-Accept")):
+			acceptKey = string(value)
+		}
 	}
+
+	if !connectionOK {
+		return fmt.Errorf("handshake failed: missing upgrade connection token")
+	}
+	if !upgradeOK {
+		return fmt.Errorf("handshake failed: invalid upgrade header")
+	}
+	if acceptKey != computeAcceptKey(secKey) {
+		return fmt.Errorf("handshake failed: invalid accept key")
+	}
+	return nil
+}
+
+func headerHasToken(v, token string) bool {
+	for _, part := range strings.Split(v, ",") {
+		if strings.EqualFold(strings.TrimSpace(part), token) {
+			return true
+		}
+	}
+	return false
+}
+
+func headerHasTokenBytes(v []byte, token string) bool {
+	for len(v) > 0 {
+		comma := bytes.IndexByte(v, ',')
+		var part []byte
+		if comma == -1 {
+			part = v
+			v = nil
+		} else {
+			part = v[:comma]
+			v = v[comma+1:]
+		}
+		if bytes.EqualFold(bytes.TrimSpace(part), []byte(token)) {
+			return true
+		}
+	}
+	return false
+}
+
+func sendHandshake(conn netpoll.Connection, req string) error {
 	writer := conn.Writer()
 	writer.WriteString(req)
 	return writer.Flush()
