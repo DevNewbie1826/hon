@@ -85,6 +85,7 @@ func TestRequestContext_Accessors(t *testing.T) {
 
 	ctx := NewRequestContext(conn, parentCtx, reader, writer)
 	defer ctx.Release()
+	ctx.SetRemoteAddr("127.0.0.1:8080")
 
 	if ctx.Conn() != conn {
 		t.Errorf("Expected Conn() to return mock conn, got %v", ctx.Conn())
@@ -97,6 +98,9 @@ func TestRequestContext_Accessors(t *testing.T) {
 	}
 	if ctx.GetWriter() != writer {
 		t.Errorf("Expected GetWriter() to return mock writer, got %v", ctx.GetWriter())
+	}
+	if got := ctx.RemoteAddr(); got != "127.0.0.1:8080" {
+		t.Errorf("Expected RemoteAddr() to return cached address, got %q", got)
 	}
 }
 

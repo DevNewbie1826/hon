@@ -19,6 +19,7 @@ type RequestContext struct {
 	req              context.Context    // Parent context for the request. // 요청에 대한 부모 컨텍스트입니다.
 	reader           *bufio.Reader      // Reusable buffered reader for the connection. // 연결을 위한 재사용 가능한 버퍼링된 리더입니다.
 	writer           *bufio.Writer      // Reusable buffered writer for the connection. // 연결을 위한 재사용 가능한 버퍼링된 라이터입니다.
+	remoteAddr       string             // Cached remote address string for repeated requests on the same connection.
 	onSetReadHandler func(ReadHandler)  // Callback for when a custom read handler is set. // 사용자 정의 읽기 핸들러가 설정될 때 호출되는 콜백입니다.
 }
 
@@ -69,6 +70,7 @@ func (c *RequestContext) reset() {
 	c.req = nil
 	c.reader = nil
 	c.writer = nil
+	c.remoteAddr = ""
 	c.onSetReadHandler = nil
 }
 
@@ -94,4 +96,12 @@ func (c *RequestContext) GetReader() *bufio.Reader {
 // GetWriter는 연결에 대한 재사용 가능한 bufio.Writer를 반환합니다.
 func (c *RequestContext) GetWriter() *bufio.Writer {
 	return c.writer
+}
+
+func (c *RequestContext) SetRemoteAddr(addr string) {
+	c.remoteAddr = addr
+}
+
+func (c *RequestContext) RemoteAddr() string {
+	return c.remoteAddr
 }
