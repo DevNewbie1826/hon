@@ -130,13 +130,11 @@ func GetRequest(ctx *appcontext.RequestContext) (*http.Request, error) {
 
 	// Set RemoteAddr
 	// 원격 주소를 설정합니다.
-	if addr := ctx.Conn().RemoteAddr(); addr != nil {
+	if remoteAddr := ctx.RemoteAddr(); remoteAddr != "" {
+		req.RemoteAddr = remoteAddr
+	} else if addr := ctx.Conn().RemoteAddr(); addr != nil {
 		req.RemoteAddr = addr.String()
 	}
-
-	// Inherit context from the RequestContext (which manages timeouts and cancellation)
-	// RequestContext(타임아웃 및 취소 관리)에서 컨텍스트를 상속받습니다.
-	req = req.WithContext(ctx.Req())
 
 	return req, nil
 }

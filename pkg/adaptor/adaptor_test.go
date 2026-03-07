@@ -92,6 +92,23 @@ func TestResponseWriter_Chunked(t *testing.T) {
 	rw.Release()
 }
 
+func TestGetRequest_DoesNotInheritParentContext(t *testing.T) {
+	type key string
+	parentCtx := context.WithValue(context.Background(), key("request-scope"), "value")
+	raw := bytes.NewBufferString("GET / HTTP/1.1\r\nHost: localhost\r\n\r\n")
+	ctx := appcontext.NewRequestContext(nil, parentCtx, bufio.NewReader(raw), bufio.NewWriter(io.Discard))
+	ctx.SetRemoteAddr("127.0.0.1:1234")
+	defer ctx.Release()
+
+	req, err := GetRequest(ctx)
+	if err != nil {
+		t.Fatalf("GetRequest failed: %v", err)
+	}
+	if got := req.Context().Value(key("request-scope")); got != nil {
+		t.Fatalf("expected GetRequest not to attach parent context, got value %v", got)
+	}
+}
+
 func contains(s, substr string) bool {
 	return len(s) >= len(substr) && bytes.Contains([]byte(s), []byte(substr))
 }
