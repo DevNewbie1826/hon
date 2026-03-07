@@ -2,6 +2,7 @@ package engine
 
 import (
 	"bufio"
+	"bytes"
 	"context"
 	"errors"
 	"io"
@@ -33,6 +34,7 @@ type ConnectionState struct {
 	ReadHandler appcontext.ReadHandler
 	CancelFunc  context.CancelFunc
 	ReadTimeout time.Duration
+	RemoteAddr  string
 	Processing  atomic.Bool
 	refCount    int32 // Reference count for safe resource release
 	done        chan struct{}
@@ -63,6 +65,7 @@ func (s *ConnectionState) Reset() {
 	s.ReadHandler = nil
 	s.Processing.Store(false)
 	s.ReadTimeout = 0
+	s.RemoteAddr = ""
 	s.refCount = 0
 	s.done = nil
 	s.err = nil
@@ -239,6 +242,46 @@ func (e *Engine) ServeConn(ctx context.Context, conn netpoll.Connection) error {
 	return nil
 }
 
+var (
+	httpHeaderEnd              = []byte("\r\n\r\n")
+	httpHeaderLineSep          = []byte("\r\n")
+	httpHeaderContentLength    = []byte("Content-Length:")
+	httpHeaderTransferEncoding = []byte("Transfer-Encoding:")
+)
+
+func shouldBypassFullRequestCheck(peekBuf []byte) bool {
+	headerEndIdx := bytes.Index(peekBuf, httpHeaderEnd)
+	if headerEndIdx == -1 || headerEndIdx > parser.MaxHeaderSize {
+		return false
+	}
+
+	headers := peekBuf[:headerEndIdx]
+	idx := bytes.Index(headers, httpHeaderLineSep)
+	if idx == -1 {
+		return false
+	}
+
+	for cur := headers[idx+len(httpHeaderLineSep):]; len(cur) > 0; {
+		lineEnd := bytes.Index(cur, httpHeaderLineSep)
+		line := cur
+		if lineEnd >= 0 {
+			line = cur[:lineEnd]
+			cur = cur[lineEnd+len(httpHeaderLineSep):]
+		} else {
+			cur = nil
+		}
+
+		if len(line) >= len(httpHeaderContentLength) && bytes.EqualFold(line[:len(httpHeaderContentLength)], httpHeaderContentLength) {
+			return false
+		}
+		if len(line) >= len(httpHeaderTransferEncoding) && bytes.EqualFold(line[:len(httpHeaderTransferEncoding)], httpHeaderTransferEncoding) {
+			return false
+		}
+	}
+
+	return true
+}
+
 func (e *Engine) serveHTTP(ctx context.Context, conn netpoll.Connection, state *ConnectionState) {
 	defer func() {
 		if r := recover(); r != nil {
@@ -265,29 +308,38 @@ func (e *Engine) serveHTTP(ctx context.Context, conn netpoll.Connection, state *
 				}
 
 				peekLen := available
-				if peekLen > 64 {
-					peekLen = 64
+				if peekLen > 256 {
+					peekLen = 256
 				}
 
 				peekBuf, _ := r.Peek(peekLen)
-				check := parser.CheckRequest(peekBuf)
-				if !check.Complete && check.Error == nil && peekLen < available {
-					peekBuf, _ = r.Peek(available)
-					check = parser.CheckRequest(peekBuf)
-				}
-				if check.Error != nil {
-					conn.Close()
-					state.Processing.Store(false)
-					return
-				}
-				if !check.Complete {
-					state.Processing.Store(false)
-					return
+				if !shouldBypassFullRequestCheck(peekBuf) {
+					check := parser.CheckRequest(peekBuf)
+					if !check.Complete && check.Error == nil && peekLen < available {
+						peekBuf, _ = r.Peek(available)
+						check = parser.CheckRequest(peekBuf)
+					}
+					if check.Error != nil {
+						conn.Close()
+						state.Processing.Store(false)
+						return
+					}
+					if !check.Complete {
+						state.Processing.Store(false)
+						return
+					}
 				}
 			}
 		}
 
+		if state.RemoteAddr == "" {
+			if addr := conn.RemoteAddr(); addr != nil {
+				state.RemoteAddr = addr.String()
+			}
+		}
+
 		requestContext := appcontext.NewRequestContext(conn, ctx, state.Reader, state.Writer)
+		requestContext.SetRemoteAddr(state.RemoteAddr)
 		requestContext.SetOnSetReadHandler(func(h appcontext.ReadHandler) {
 			state.ReadHandler = h
 		})
@@ -368,14 +420,17 @@ func (e *Engine) handleRequest(ctx *appcontext.RequestContext) (*http.Request, b
 		return nil, false, err
 	}
 
-	respWriter := adaptor.NewResponseWriter(ctx, req)
-	defer respWriter.Release()
-
+	baseCtx := ctx.Req()
 	if e.requestTimeout > 0 {
-		timeoutCtx, cancel := context.WithTimeout(req.Context(), e.requestTimeout)
+		timeoutCtx, cancel := context.WithTimeout(baseCtx, e.requestTimeout)
 		req = req.WithContext(timeoutCtx)
 		defer cancel()
+	} else {
+		req = req.WithContext(baseCtx)
 	}
+
+	respWriter := adaptor.NewResponseWriter(ctx, req)
+	defer respWriter.Release()
 
 	var panicked bool
 	func() {

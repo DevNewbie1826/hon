@@ -215,6 +215,36 @@ func TestEngine_ServeConn_PanicRecovery(t *testing.T) {
 	}
 }
 
+func TestEngine_RequestContext_InheritsConnectionState(t *testing.T) {
+	var state *ConnectionState
+	inherited := make(chan bool, 1)
+
+	handler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		inherited <- r.Context().Value(CtxKeyConnectionState) == state
+		w.WriteHeader(http.StatusOK)
+	})
+	eng := NewEngine(handler)
+
+	conn := &MockConnection{}
+	conn.fillRequest("GET", "/", "")
+
+	state = NewConnectionState(time.Second)
+	defer state.Cancel()
+
+	if err := eng.ServeConn(state, conn); err != nil {
+		t.Fatalf("ServeConn failed: %v", err)
+	}
+
+	select {
+	case ok := <-inherited:
+		if !ok {
+			t.Fatal("expected handler request context to inherit ConnectionState")
+		}
+	default:
+		t.Fatal("handler did not report request context inheritance")
+	}
+}
+
 func TestEngine_ServeConn_KeepAlive(t *testing.T) {
 	// 1. Setup Engine
 	handler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -390,6 +420,43 @@ func TestEngine_ServeConn_WaitsForPartialRequest(t *testing.T) {
 	}
 	if got := conn.writeBuf.Len(); got != 0 {
 		t.Fatalf("expected no response for partial request, got %d bytes", got)
+	}
+}
+
+func TestShouldBypassFullRequestCheck(t *testing.T) {
+	tests := []struct {
+		name string
+		data []byte
+		want bool
+	}{
+		{
+			name: "simple GET without body headers",
+			data: []byte("GET / HTTP/1.1\r\nHost: localhost\r\nUser-Agent: hon-test\r\n\r\n"),
+			want: true,
+		},
+		{
+			name: "content length keeps full check",
+			data: []byte("POST / HTTP/1.1\r\nHost: localhost\r\nContent-Length: 4\r\n\r\nbody"),
+			want: false,
+		},
+		{
+			name: "chunked keeps full check",
+			data: []byte("POST / HTTP/1.1\r\nHost: localhost\r\nTransfer-Encoding: chunked\r\n\r\n"),
+			want: false,
+		},
+		{
+			name: "incomplete headers keep full check",
+			data: []byte("GET / HTTP/1.1\r\nHost: localhost\r\nUser-Agent: hon-test"),
+			want: false,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := shouldBypassFullRequestCheck(tt.data); got != tt.want {
+				t.Fatalf("shouldBypassFullRequestCheck() = %v, want %v", got, tt.want)
+			}
+		})
 	}
 }
 
